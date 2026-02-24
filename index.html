@@ -10,7 +10,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
-            @apply bg-slate-950 text-slate-100 font-sans;
+            @apply bg-slate-900 text-slate-100 font-sans;
         }
         .modal-overlay {
             background: rgba(0, 0, 0, 0.7);
@@ -149,7 +149,7 @@
                     <div className="bg-slate-800 rounded-lg shadow-lg w-full max-w-md p-6 relative">
                         <button
                             onClick={onClose}
-                            className="absolute top-4 right-4 text-slate-400 hover:text-slate-200"
+                            className="absolute top-4 right-4 text-slate-300 hover:text-slate-200"
                         >
                             ✕
                         </button>
@@ -217,7 +217,7 @@
             <div className="text-center py-12">
                 <div className="text-4xl mb-4">{icon}</div>
                 <h3 className="text-lg font-semibold mb-2">{title}</h3>
-                <p className="text-slate-400 mb-4">{message}</p>
+                <p className="text-slate-300 mb-4">{message}</p>
                 {action}
             </div>
         );
@@ -264,12 +264,12 @@
             };
 
             return (
-                <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+                <div className="min-h-screen bg-slate-900 flex items-center justify-center">
                     <div className="bg-slate-800 rounded-lg p-8 w-full max-w-md">
                         <div className="text-center mb-8">
                             <div className="text-4xl mb-2">🏢</div>
                             <h1 className="text-2xl font-bold">KM Team CRM</h1>
-                            <p className="text-slate-400 mt-2">Create your first admin account</p>
+                            <p className="text-slate-300 mt-2">Create your first admin account</p>
                         </div>
 
                         <form onSubmit={handleSubmit} className="space-y-4">
@@ -344,12 +344,12 @@
             };
 
             return (
-                <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+                <div className="min-h-screen bg-slate-900 flex items-center justify-center">
                     <div className="bg-slate-800 rounded-lg p-8 w-full max-w-md">
                         <div className="text-center mb-8">
                             <div className="text-4xl mb-2">🏢</div>
                             <h1 className="text-2xl font-bold">KM Team CRM</h1>
-                            <p className="text-slate-400 mt-2">Welcome back</p>
+                            <p className="text-slate-300 mt-2">Welcome back</p>
                         </div>
 
                         <form onSubmit={handleSubmit} className="space-y-4">
@@ -428,23 +428,23 @@
                     {/* Stats Row */}
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                         <div className="bg-slate-800 rounded-lg p-4">
-                            <p className="text-slate-400 text-sm">Total Contacts</p>
+                            <p className="text-slate-300 text-sm">Total Contacts</p>
                             <p className="text-2xl font-bold text-blue-400">{stats?.total_contacts || 0}</p>
                         </div>
                         <div className="bg-slate-800 rounded-lg p-4">
-                            <p className="text-slate-400 text-sm">Active Deals</p>
+                            <p className="text-slate-300 text-sm">Active Deals</p>
                             <p className="text-2xl font-bold text-blue-400">{stats?.active_deals || 0}</p>
                         </div>
                         <div className="bg-slate-800 rounded-lg p-4">
-                            <p className="text-slate-400 text-sm">Active Listings</p>
+                            <p className="text-slate-300 text-sm">Active Listings</p>
                             <p className="text-2xl font-bold text-blue-400">{stats?.active_listings || 0}</p>
                         </div>
                         <div className="bg-slate-800 rounded-lg p-4">
-                            <p className="text-slate-400 text-sm">Tasks Today</p>
+                            <p className="text-slate-300 text-sm">Tasks Today</p>
                             <p className="text-2xl font-bold text-blue-400">{stats?.tasks_due_today || 0}</p>
                         </div>
                         <div className="bg-slate-800 rounded-lg p-4">
-                            <p className="text-slate-400 text-sm">Overdue</p>
+                            <p className="text-slate-300 text-sm">Overdue</p>
                             <p className={`text-2xl font-bold ${stats?.tasks_overdue > 0 ? 'text-red-400' : 'text-blue-400'}`}>
                                 {stats?.tasks_overdue || 0}
                             </p>
@@ -485,7 +485,7 @@
                         <div className="lg:col-span-1 bg-slate-800 rounded-lg p-6">
                             <h3 className="text-lg font-semibold mb-4">Upcoming Tasks</h3>
                             {upcomingTasks.length === 0 ? (
-                                <p className="text-slate-400 text-sm">No upcoming tasks</p>
+                                <p className="text-slate-300 text-sm">No upcoming tasks</p>
                             ) : (
                                 <div className="space-y-2">
                                     {upcomingTasks.map((task) => (
@@ -498,7 +498,7 @@
                                             }`}
                                         >
                                             <p className="font-medium">{task.title}</p>
-                                            <p className="text-xs text-slate-400">
+                                            <p className="text-xs text-slate-300">
                                                 {new Date(task.due_date).toLocaleDateString()}
                                             </p>
                                         </div>
@@ -511,7 +511,7 @@
                         <div className="lg:col-span-2 bg-slate-800 rounded-lg p-6">
                             <h3 className="text-lg font-semibold mb-4">Recent Activity</h3>
                             {recentActivity.length === 0 ? (
-                                <p className="text-slate-400 text-sm">No activity yet</p>
+                                <p className="text-slate-300 text-sm">No activity yet</p>
                             ) : (
                                 <div className="space-y-3">
                                     {recentActivity.map((item) => (
@@ -642,7 +642,7 @@
                     <div className="flex justify-between items-center">
                         <div>
                             <h1 className="text-2xl font-bold">Contacts</h1>
-                            <p className="text-slate-400">{filteredContacts.length} contacts</p>
+                            <p className="text-slate-300">{filteredContacts.length} contacts</p>
                         </div>
                         <button
                             onClick={() => {
@@ -735,11 +735,11 @@
                                         <tr key={contact.id} className="border-t border-slate-700 hover:bg-slate-700/50">
                                             <td className="px-4 py-3 font-medium">{contact.first_name} {contact.last_name || ''}</td>
                                             <td className="px-4 py-3 text-slate-300">{contact.company || '-'}</td>
-                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.email || '-'}</td>
-                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.phone || '-'}</td>
-                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.mobile_phone || '-'}</td>
-                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.prospect_type || '-'}</td>
-                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.submarket || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.email || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.phone || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.mobile_phone || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.prospect_type || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.submarket || '-'}</td>
                                             <td className="px-4 py-3 text-sm">
                                                 <button
                                                     onClick={() => {
@@ -836,7 +836,7 @@
             const activeTags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
             const input = (label, field, opts = {}) => (
                 <div>
-                    <label className="block text-xs text-slate-400 mb-1">{label}</label>
+                    <label className="block text-xs text-slate-300 mb-1">{label}</label>
                     <input type={opts.type || 'text'} value={form[field]} onChange={set(field)}
                         placeholder={opts.placeholder || ''}
                         className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
@@ -844,7 +844,7 @@
             );
             const select = (label, field, options) => (
                 <div>
-                    <label className="block text-xs text-slate-400 mb-1">{label}</label>
+                    <label className="block text-xs text-slate-300 mb-1">{label}</label>
                     <select value={form[field]} onChange={set(field)}
                         className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600">
                         <option value="">— Select —</option>
@@ -876,7 +876,7 @@
 
                         {/* Company */}
                         <div>
-                            <label className="block text-xs text-slate-400 mb-1">Company</label>
+                            <label className="block text-xs text-slate-300 mb-1">Company</label>
                             <input list="company-list" value={form.company_name} onChange={set('company_name')}
                                 placeholder="Type or select a company"
                                 className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
@@ -907,7 +907,7 @@
 
                         {/* Contact type tags */}
                         <div>
-                            <label className="block text-xs text-slate-400 mb-2">Contact Type (select all that apply)</label>
+                            <label className="block text-xs text-slate-300 mb-2">Contact Type (select all that apply)</label>
                             <div className="flex flex-wrap gap-2">
                                 {contactTypes.map(tag => (
                                     <button key={tag} type="button" onClick={() => toggleTag(tag)}
@@ -920,7 +920,7 @@
 
                         {/* Notes */}
                         <div>
-                            <label className="block text-xs text-slate-400 mb-1">Notes / Activities</label>
+                            <label className="block text-xs text-slate-300 mb-1">Notes / Activities</label>
                             <textarea value={form.notes} onChange={set('notes')} rows={3}
                                 placeholder="Notes, activity history..."
                                 className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600 resize-none" />
@@ -1056,7 +1056,7 @@
                                     <div key={stage} className="stage-column bg-slate-800 rounded-lg p-4">
                                         <div className="mb-4">
                                             <h3 className="font-semibold">{stage}</h3>
-                                            <div className="flex justify-between text-xs text-slate-400 mt-1">
+                                            <div className="flex justify-between text-xs text-slate-300 mt-1">
                                                 <span>{stageDeals.length} deals</span>
                                                 <span>${(totalValueByStage(stage) / 1000000).toFixed(1)}M</span>
                                             </div>
@@ -1069,13 +1069,13 @@
                                                     className={`bg-slate-700 border-l-4 rounded p-3 text-sm hover:bg-slate-600 transition ${stageColors[stage]}`}
                                                 >
                                                     <p className="font-medium text-white">{deal.title}</p>
-                                                    <p className="text-xs text-slate-400 mt-1">
+                                                    <p className="text-xs text-slate-300 mt-1">
                                                         {
                                                             contacts.find((c) => c.id === deal.contact_id)
                                                                 ?.name
                                                         }
                                                     </p>
-                                                    <p className="text-xs text-slate-400">
+                                                    <p className="text-xs text-slate-300">
                                                         {
                                                             properties.find((p) => p.id === deal.property_id)
                                                                 ?.address
@@ -1089,7 +1089,7 @@
                                                         {stage !== 'Prospect' && (
                                                             <button
                                                                 onClick={() => handleMoveStage(deal, 'backward')}
-                                                                className="text-slate-400 hover:text-white"
+                                                                className="text-slate-300 hover:text-white"
                                                             >
                                                                 ← Back
                                                             </button>
@@ -1097,7 +1097,7 @@
                                                         {stage !== 'Closed Lost' && stage !== 'Closed Won' && (
                                                             <button
                                                                 onClick={() => handleMoveStage(deal, 'forward')}
-                                                                className="text-slate-400 hover:text-white"
+                                                                className="text-slate-300 hover:text-white"
                                                             >
                                                                 Forward →
                                                             </button>
@@ -1401,7 +1401,7 @@
                     <div className="flex justify-between items-center">
                         <div>
                             <h1 className="text-2xl font-bold">Properties</h1>
-                            <p className="text-slate-400">{filteredProperties.length} properties</p>
+                            <p className="text-slate-300">{filteredProperties.length} properties</p>
                         </div>
                         <button
                             onClick={() => {
@@ -1492,10 +1492,10 @@
                                         <tr key={prop.id} className="border-t border-slate-700 hover:bg-slate-700/50">
                                             <td className="px-4 py-3">{prop.address}</td>
                                             <td className="px-4 py-3 text-slate-300">{prop.property_type}</td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-slate-300">
                                                 {(prop.size_sf || 0).toLocaleString()} SF
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-slate-300">
                                                 ${(prop.asking_rate || 0).toFixed(2)}/SF
                                             </td>
                                             <td className="px-4 py-3">
@@ -1902,12 +1902,12 @@
                                                 <Badge color={getPriorityColor(task.priority)}>
                                                     {task.priority || 'Medium'}
                                                 </Badge>
-                                                <span className="text-xs text-slate-400">
+                                                <span className="text-xs text-slate-300">
                                                     {new Date(task.due_date).toLocaleDateString()}
                                                 </span>
                                             </div>
                                             {task.notes && (
-                                                <p className="text-sm text-slate-400 mt-2">{task.notes}</p>
+                                                <p className="text-sm text-slate-300 mt-2">{task.notes}</p>
                                             )}
                                         </div>
                                         <div className="flex gap-2">
@@ -2269,7 +2269,7 @@
                     {/* API Key Section */}
                     <div className="bg-slate-800 rounded-lg p-6">
                         <h2 className="text-xl font-bold mb-4">Claude API Key</h2>
-                        <p className="text-slate-400 text-sm mb-4">
+                        <p className="text-slate-300 text-sm mb-4">
                             Add your Claude API key to enable AI Assistant features.
                         </p>
                         <form onSubmit={handleApiKeyUpdate} className="space-y-4">
@@ -2357,7 +2357,7 @@
                             <h3 className="font-medium text-sm text-slate-300">New Team Member</h3>
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                    <label className="block text-xs text-slate-400 mb-1">Name</label>
+                                    <label className="block text-xs text-slate-300 mb-1">Name</label>
                                     <input
                                         type="text"
                                         value={newName}
@@ -2367,7 +2367,7 @@
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs text-slate-400 mb-1">Email</label>
+                                    <label className="block text-xs text-slate-300 mb-1">Email</label>
                                     <input
                                         type="email"
                                         value={newEmail}
@@ -2377,7 +2377,7 @@
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs text-slate-400 mb-1">Password</label>
+                                    <label className="block text-xs text-slate-300 mb-1">Password</label>
                                     <input
                                         type="password"
                                         value={newPassword}
@@ -2387,7 +2387,7 @@
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs text-slate-400 mb-1">Role</label>
+                                    <label className="block text-xs text-slate-300 mb-1">Role</label>
                                     <select
                                         value={newRole}
                                         onChange={(e) => setNewRole(e.target.value)}
@@ -2420,13 +2420,13 @@
 
                     <div className="divide-y divide-slate-700">
                         {teamMembers.length === 0 ? (
-                            <p className="text-slate-400 text-sm py-2">No team members yet.</p>
+                            <p className="text-slate-300 text-sm py-2">No team members yet.</p>
                         ) : (
                             teamMembers.map((member) => (
                                 <div key={member.id} className="py-3 flex items-center justify-between">
                                     <div>
                                         <p className="font-medium text-sm">{member.name}</p>
-                                        <p className="text-xs text-slate-400">{member.email}</p>
+                                        <p className="text-xs text-slate-300">{member.email}</p>
                                     </div>
                                     <span className="text-xs bg-slate-700 px-2 py-1 rounded capitalize">{member.role}</span>
                                 </div>
@@ -2569,7 +2569,7 @@
                     {/* Messages */}
                     <div className="flex-1 bg-slate-800 rounded-lg p-4 mb-4 overflow-y-auto space-y-4">
                         {messages.length === 0 ? (
-                            <p className="text-slate-400 text-center mt-8">
+                            <p className="text-slate-300 text-center mt-8">
                                 Start a conversation with your AI assistant
                             </p>
                         ) : (
@@ -2600,7 +2600,7 @@
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                            className="flex-1 bg-slate-800 rounded px-4 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            className="flex-1 bg-slate-800 rounded px-4 py-2 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
                             placeholder="Ask me anything..."
                             disabled={loading}
                         />
@@ -2642,7 +2642,20 @@
         const ImportPage = () => {
             const [files, setFiles] = React.useState([]); // [{name, type, csv, status, result}]
             const [importing, setImporting] = React.useState(false);
+            const [clearing, setClearing] = React.useState(false);
             const { show } = useToast();
+
+            const clearEntity = async (entity, label) => {
+                if (!confirm(`Are you sure you want to delete ALL ${label} data? This cannot be undone.`)) return;
+                setClearing(true);
+                const result = await api.request('DELETE', `/api/import/clear/${entity}`);
+                if (result.data?.success) {
+                    show(`${label} data cleared (${result.data.deleted} records)`, 'success');
+                } else {
+                    show(result.data?.error || 'Failed to clear', 'error');
+                }
+                setClearing(false);
+            };
 
             const readFile = (file) => new Promise((resolve, reject) => {
                 const reader = new FileReader();
@@ -2692,7 +2705,7 @@
                 <div className="space-y-6 max-w-2xl">
                     <div>
                         <h1 className="text-2xl font-bold mb-2">Import Data</h1>
-                        <p className="text-slate-400 text-sm">Drop all your CRE OneSource CSV files at once — the importer will auto-detect each type and run them in the correct order.</p>
+                        <p className="text-slate-300 text-sm">Drop all your CRE OneSource CSV files at once — the importer will auto-detect each type and run them in the correct order.</p>
                     </div>
 
                     {/* Drop zone */}
@@ -2723,7 +2736,7 @@
                                             <span className="text-xl">{meta ? meta.icon : '❓'}</span>
                                             <div className="min-w-0">
                                                 <p className="text-sm font-medium truncate">{f.name}</p>
-                                                <p className="text-xs text-slate-400">{meta ? meta.label : 'Unrecognized — will be skipped'}</p>
+                                                <p className="text-xs text-slate-300">{meta ? meta.label : 'Unrecognized — will be skipped'}</p>
                                             </div>
                                         </div>
                                         <div className="flex-shrink-0 text-right">
@@ -2752,6 +2765,30 @@
                             {importing ? <><Spinner /> Importing...</> : '🚀 Import All Files'}
                         </button>
                     )}
+
+                    {/* Clear Data Section */}
+                    <div className="bg-slate-800 rounded-lg p-6 border border-red-900/30">
+                        <h2 className="text-lg font-bold mb-2 text-red-400">Clear Data for Re-Import</h2>
+                        <p className="text-slate-300 text-sm mb-4">Delete existing records before re-importing. This is permanent.</p>
+                        <div className="flex flex-wrap gap-2">
+                            {[
+                                { entity: 'companies', label: 'Companies' },
+                                { entity: 'properties', label: 'Properties' },
+                                { entity: 'contacts', label: 'Contacts' },
+                                { entity: 'tasks', label: 'Activities/Tasks' },
+                                { entity: 'deals', label: 'Deals' },
+                            ].map(({ entity, label }) => (
+                                <button key={entity} onClick={() => clearEntity(entity, label)} disabled={clearing}
+                                    className="px-3 py-1.5 bg-red-900/40 hover:bg-red-800/60 text-red-300 rounded text-sm disabled:opacity-50 transition">
+                                    Clear {label}
+                                </button>
+                            ))}
+                            <button onClick={() => clearEntity('all', 'ALL')} disabled={clearing}
+                                className="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white rounded text-sm disabled:opacity-50 transition font-medium">
+                                Clear Everything
+                            </button>
+                        </div>
+                    </div>
                 </div>
             );
         };
@@ -2819,24 +2856,24 @@
             ];
 
             return (
-                <div className="flex h-screen bg-slate-950">
+                <div className="flex h-screen bg-slate-900">
                     {/* Sidebar */}
-                    <div className="w-64 bg-slate-900 border-r border-slate-800 flex flex-col">
+                    <div className="w-64 bg-slate-800 border-r border-slate-700 flex flex-col">
                         {/* Logo */}
-                        <div className="p-6 border-b border-slate-800">
+                        <div className="p-6 border-b border-slate-700">
                             <h1 className="text-xl font-bold flex items-center gap-2">
                                 <span>🏢</span>KM Team CRM
                             </h1>
                         </div>
 
                         {/* Search */}
-                        <div className="p-4 border-b border-slate-800 relative">
+                        <div className="p-4 border-b border-slate-700 relative">
                             <input
                                 type="text"
                                 placeholder="Search..."
                                 value={searchQuery}
                                 onChange={(e) => setSearchQuery(e.target.value)}
-                                className="w-full bg-slate-800 rounded px-3 py-2 text-white placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                className="w-full bg-slate-800 rounded px-3 py-2 text-white placeholder-slate-400 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
                             />
                             {showSearchResults && searchResults.length > 0 && (
                                 <div className="absolute top-full left-4 right-4 mt-2 bg-slate-800 rounded shadow-lg z-10 max-h-64 overflow-y-auto">
@@ -2851,7 +2888,7 @@
                                             className="w-full text-left px-3 py-2 hover:bg-slate-700 text-sm"
                                         >
                                             <p className="font-medium">{result.name || result.title}</p>
-                                            <p className="text-xs text-slate-400">{result.type}</p>
+                                            <p className="text-xs text-slate-300">{result.type}</p>
                                         </button>
                                     ))}
                                 </div>
@@ -2877,7 +2914,7 @@
                         </nav>
 
                         {/* Bottom */}
-                        <div className="border-t border-slate-800 p-4 space-y-2">
+                        <div className="border-t border-slate-700 p-4 space-y-2">
                             <button
                                 onClick={() => onNavigate('activity')}
                                 className={`w-full text-left px-4 py-2 rounded text-sm ${
@@ -2951,7 +2988,7 @@
 
             if (checkingSetup || authLoading) {
                 return (
-                    <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+                    <div className="min-h-screen bg-slate-900 flex items-center justify-center">
                         <Spinner />
                     </div>
                 );
