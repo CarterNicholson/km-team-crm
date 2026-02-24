@@ -1,1512 +1,2980 @@
-const express = require('express');
-const { Pool } = require('pg');
-const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const path = require('path');
-const https = require('https');
-const fs = require('fs');
-
-// ─── Password hashing using built-in crypto (no bcrypt dependency) ────────────
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${hash}`;
-}
-function verifyPassword(password, stored) {
-  const [salt, hash] = stored.split(':');
-  const test = crypto.scryptSync(password, salt, 64).toString('hex');
-  return hash === test;
-}
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'km-crm-dev-secret-CHANGE-IN-PRODUCTION';
-
-app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-// Increase timeout for large imports
-app.use('/api/import', (req, res, next) => { req.setTimeout(300000); res.setTimeout(300000); next(); });
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DATABASE SETUP
-// ═══════════════════════════════════════════════════════════════════════════════
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://localhost/km_crm',
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
-
-// Initialize database schema on startup
-async function initializeDatabase() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT DEFAULT 'broker',
-        claude_api_key TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS companies (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        type TEXT,
-        industry TEXT,
-        website TEXT,
-        phone TEXT,
-        address TEXT,
-        city TEXT,
-        state TEXT DEFAULT 'WA',
-        submarket TEXT,
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS contacts (
-        id SERIAL PRIMARY KEY,
-        first_name TEXT NOT NULL,
-        last_name TEXT,
-        company_id INTEGER REFERENCES companies(id),
-        email TEXT,
-        phone TEXT,
-        mobile_phone TEXT,
-        tags TEXT DEFAULT '',
-        prospect_type TEXT,
-        group_dot TEXT,
-        asset_type TEXT,
-        submarket TEXT,
-        size_requirement TEXT,
-        industry TEXT,
-        building_name TEXT,
-        building_address TEXT,
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      -- Migrate existing contacts table (safe to run repeatedly)
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS mobile_phone TEXT;
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS prospect_type TEXT;
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS group_dot TEXT;
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS asset_type TEXT;
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS building_name TEXT;
-      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS building_address TEXT;
-
-      CREATE TABLE IF NOT EXISTS properties (
-        id SERIAL PRIMARY KEY,
-        name TEXT,
-        address TEXT NOT NULL,
-        city TEXT,
-        state TEXT DEFAULT 'WA',
-        submarket TEXT,
-        type TEXT DEFAULT 'industrial',
-        size_sf INTEGER,
-        asking_rate TEXT,
-        rate_type TEXT DEFAULT 'NNN',
-        status TEXT DEFAULT 'available',
-        is_listing BOOLEAN DEFAULT FALSE,
-        list_date TEXT,
-        expiration_date TEXT,
-        listing_broker_id INTEGER REFERENCES users(id),
-        commission_rate TEXT,
-        marketing_notes TEXT,
-        clear_height TEXT,
-        dock_doors INTEGER,
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS deals (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        stage TEXT DEFAULT 'prospect',
-        deal_type TEXT DEFAULT 'lease_tenant',
-        contact_id INTEGER REFERENCES contacts(id),
-        property_id INTEGER REFERENCES properties(id),
-        value TEXT,
-        size_sf TEXT,
-        close_date TEXT,
-        notes TEXT,
-        assigned_to INTEGER REFERENCES users(id),
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS tasks (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        due_date TEXT,
-        completed BOOLEAN DEFAULT FALSE,
-        priority TEXT DEFAULT 'medium',
-        contact_id INTEGER,
-        deal_id INTEGER,
-        property_id INTEGER,
-        assigned_to INTEGER REFERENCES users(id),
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS inquiries (
-        id SERIAL PRIMARY KEY,
-        property_id INTEGER NOT NULL REFERENCES properties(id),
-        contact_id INTEGER NOT NULL REFERENCES contacts(id),
-        status TEXT DEFAULT 'new',
-        interest_level TEXT DEFAULT 'medium',
-        size_need TEXT,
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS activity_log (
-        id SERIAL PRIMARY KEY,
-        action TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
-        entity_id INTEGER,
-        entity_name TEXT,
-        details TEXT,
-        user_id INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    console.log('Database schema initialized successfully');
-  } catch (err) {
-    console.error('Error initializing database:', err);
-    process.exit(1);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-function authenticate(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header) return res.status(401).json({ error: 'No token provided' });
-  try {
-    req.user = jwt.verify(header.split(' ')[1], JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
-  }
-}
-
-async function logActivity(action, entityType, entityId, entityName, details, userId) {
-  try {
-    await pool.query(
-      'INSERT INTO activity_log (action, entity_type, entity_id, entity_name, details, user_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [action, entityType, entityId, entityName, details || null, userId]
-    );
-  } catch (err) {
-    console.error('Error logging activity:', err);
-  }
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// AUTH ROUTES
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/auth/status', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT COUNT(*) as c FROM users');
-    res.json({ hasUsers: parseInt(result.rows[0].c) > 0 });
-  } catch (err) {
-    console.error('Error checking auth status:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/auth/setup', async (req, res) => {
-  try {
-    const existing = await pool.query('SELECT COUNT(*) as c FROM users');
-    if (parseInt(existing.rows[0].c) > 0) return res.status(400).json({ error: 'Setup already completed' });
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    const hash = hashPassword(password);
-    const result = await pool.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id',
-      [name, email, hash, 'admin']
-    );
-    const user = { id: result.rows[0].id, name, email, role: 'admin' };
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    await logActivity('create', 'user', user.id, name, 'Initial admin setup', user.id);
-    res.json({ token, user });
-  } catch (err) {
-    console.error('Error during setup:', err);
-    res.status(500).json({ error: 'Setup failed' });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    const user = result.rows[0];
-    if (!user || !verifyPassword(password, user.password_hash)) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    await logActivity('login', 'user', user.id, user.name, null, user.id);
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-  } catch (err) {
-    console.error('Error during login:', err);
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
-
-app.get('/api/auth/me', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id, name, email, role, claude_api_key FROM users WHERE id = $1', [req.user.id]);
-    const user = result.rows[0];
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ ...user, hasApiKey: !!user.claude_api_key });
-  } catch (err) {
-    console.error('Error fetching user:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// USER ROUTES
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/users', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id, name, email, role, created_at FROM users ORDER BY name');
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching users:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/users', authenticate, async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-    const { name, email, password, role } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password required' });
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Email already in use' });
-    }
-    const hash = hashPassword(password);
-    const result = await pool.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email, role',
-      [name, email, hash, role || 'broker']
-    );
-    const user = result.rows[0];
-    await logActivity('create', 'user', user.id, name, `New team member added (${role || 'broker'})`, req.user.id);
-    res.json(user);
-  } catch (err) {
-    console.error('Error creating user:', err);
-    res.status(500).json({ error: 'Failed to create user' });
-  }
-});
-
-app.put('/api/users/:id', authenticate, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    if (req.user.id !== id && req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-    const { name, email, claude_api_key } = req.body;
-    await pool.query(
-      'UPDATE users SET name = COALESCE($1, name), email = COALESCE($2, email), claude_api_key = $3 WHERE id = $4',
-      [name || null, email || null, claude_api_key !== undefined ? claude_api_key : null, id]
-    );
-    const result = await pool.query('SELECT id, name, email, role, claude_api_key FROM users WHERE id = $1', [id]);
-    const user = result.rows[0];
-    res.json({ ...user, hasApiKey: !!user.claude_api_key });
-  } catch (err) {
-    console.error('Error updating user:', err);
-    res.status(500).json({ error: 'Failed to update user' });
-  }
-});
-
-app.put('/api/users/:id/password', authenticate, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    if (req.user.id !== id) return res.status(403).json({ error: 'Forbidden' });
-    const { current_password, new_password } = req.body;
-    if (!new_password || new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
-    const user = result.rows[0];
-    if (!verifyPassword(current_password, user.password_hash)) {
-      return res.status(400).json({ error: 'Current password is incorrect' });
-    }
-    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(new_password), id]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error updating password:', err);
-    res.status(500).json({ error: 'Failed to update password' });
-  }
-});
-
-app.delete('/api/users/:id', authenticate, async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-    if (req.user.id === parseInt(req.params.id)) return res.status(400).json({ error: 'Cannot delete yourself' });
-    const result = await pool.query('SELECT name FROM users WHERE id = $1', [req.params.id]);
-    const u = result.rows[0];
-    await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'user', parseInt(req.params.id), u?.name, 'Team member removed', req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting user:', err);
-    res.status(500).json({ error: 'Failed to delete user' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// COMPANIES
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/companies', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT c.*, u.name as created_by_name,
-      (SELECT COUNT(*) FROM contacts WHERE company_id = c.id) as contact_count
-      FROM companies c LEFT JOIN users u ON c.created_by = u.id
-      ORDER BY c.name
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching companies:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/companies', authenticate, async (req, res) => {
-  try {
-    const { name, type, industry, website, phone, address, city, state, submarket, notes } = req.body;
-    if (!name) return res.status(400).json({ error: 'Company name required' });
-    const result = await pool.query(
-      'INSERT INTO companies (name, type, industry, website, phone, address, city, state, submarket, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [name, type, industry, website, phone, address, city, state || 'WA', submarket, notes, req.user.id]
-    );
-    const row = result.rows[0];
-    await logActivity('create', 'company', row.id, name, null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating company:', err);
-    res.status(500).json({ error: 'Failed to create company' });
-  }
-});
-
-app.put('/api/companies/:id', authenticate, async (req, res) => {
-  try {
-    const { name, type, industry, website, phone, address, city, state, submarket, notes } = req.body;
-    await pool.query(
-      'UPDATE companies SET name=$1, type=$2, industry=$3, website=$4, phone=$5, address=$6, city=$7, state=$8, submarket=$9, notes=$10, updated_at=$11 WHERE id=$12',
-      [name, type, industry, website, phone, address, city, state, submarket, notes, now(), req.params.id]
-    );
-    const result = await pool.query('SELECT * FROM companies WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-    await logActivity('update', 'company', row.id, row.name, null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating company:', err);
-    res.status(500).json({ error: 'Failed to update company' });
-  }
-});
-
-app.delete('/api/companies/:id', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT name FROM companies WHERE id = $1', [req.params.id]);
-    const c = result.rows[0];
-    await pool.query('UPDATE contacts SET company_id = NULL WHERE company_id = $1', [req.params.id]);
-    await pool.query('DELETE FROM companies WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'company', parseInt(req.params.id), c?.name, null, req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting company:', err);
-    res.status(500).json({ error: 'Failed to delete company' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CONTACTS
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/contacts', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT c.*,
-        (c.first_name || ' ' || COALESCE(c.last_name, '')) as name,
-        co.name as company_name,
-        co.name as company,
-        u.name as created_by_name
-      FROM contacts c
-      LEFT JOIN companies co ON c.company_id = co.id
-      LEFT JOIN users u ON c.created_by = u.id
-      ORDER BY c.first_name, c.last_name
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching contacts:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.get('/api/contacts/:id', authenticate, async (req, res) => {
-  try {
-    const contactResult = await pool.query(`
-      SELECT c.*, co.name as company_name FROM contacts c
-      LEFT JOIN companies co ON c.company_id = co.id WHERE c.id = $1
-    `, [req.params.id]);
-    const c = contactResult.rows[0];
-    if (!c) return res.status(404).json({ error: 'Contact not found' });
-
-    const dealsResult = await pool.query('SELECT * FROM deals WHERE contact_id = $1 ORDER BY created_at DESC', [req.params.id]);
-    const tasksResult = await pool.query('SELECT * FROM tasks WHERE contact_id = $1 ORDER BY due_date', [req.params.id]);
-    const inquiriesResult = await pool.query(`
-      SELECT i.*, p.address as property_address, p.name as property_name
-      FROM inquiries i LEFT JOIN properties p ON i.property_id = p.id
-      WHERE i.contact_id = $1 ORDER BY i.created_at DESC
-    `, [req.params.id]);
-
-    res.json({ ...c, deals: dealsResult.rows, tasks: tasksResult.rows, inquiries: inquiriesResult.rows });
-  } catch (err) {
-    console.error('Error fetching contact:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/contacts', authenticate, async (req, res) => {
-  try {
-    const { first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes } = req.body;
-    if (!first_name) return res.status(400).json({ error: 'First name required' });
-    const result = await pool.query(
-      'INSERT INTO contacts (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *',
-      [first_name, last_name, company_id || null, email, phone, mobile_phone, tags || '', prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, req.user.id]
-    );
-    const row = result.rows[0];
-    await logActivity('create', 'contact', row.id, `${first_name} ${last_name || ''}`.trim(), null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating contact:', err);
-    res.status(500).json({ error: 'Failed to create contact' });
-  }
-});
-
-app.put('/api/contacts/:id', authenticate, async (req, res) => {
-  try {
-    const { first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes } = req.body;
-    await pool.query(
-      'UPDATE contacts SET first_name=$1, last_name=$2, company_id=$3, email=$4, phone=$5, mobile_phone=$6, tags=$7, prospect_type=$8, group_dot=$9, asset_type=$10, submarket=$11, size_requirement=$12, industry=$13, building_name=$14, building_address=$15, notes=$16, updated_at=$17 WHERE id=$18',
-      [first_name, last_name, company_id || null, email, phone, mobile_phone, tags || '', prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, now(), req.params.id]
-    );
-    const result = await pool.query('SELECT * FROM contacts WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-    await logActivity('update', 'contact', row.id, `${row.first_name} ${row.last_name || ''}`.trim(), null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating contact:', err);
-    res.status(500).json({ error: 'Failed to update contact' });
-  }
-});
-
-app.delete('/api/contacts/:id', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT first_name, last_name FROM contacts WHERE id = $1', [req.params.id]);
-    const c = result.rows[0];
-    await pool.query('DELETE FROM contacts WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'contact', parseInt(req.params.id), `${c?.first_name} ${c?.last_name || ''}`.trim(), null, req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting contact:', err);
-    res.status(500).json({ error: 'Failed to delete contact' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROPERTIES
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/properties', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT p.*, u.name as listing_broker_name, u2.name as created_by_name,
-      (SELECT COUNT(*) FROM inquiries WHERE property_id = p.id) as inquiry_count,
-      (SELECT COUNT(*) FROM deals WHERE property_id = p.id) as deal_count
-      FROM properties p
-      LEFT JOIN users u ON p.listing_broker_id = u.id
-      LEFT JOIN users u2 ON p.created_by = u2.id
-      ORDER BY p.created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching properties:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.get('/api/properties/listings', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT p.*, u.name as listing_broker_name,
-      (SELECT COUNT(*) FROM inquiries WHERE property_id = p.id) as inquiry_count,
-      (SELECT COUNT(*) FROM deals WHERE property_id = p.id) as deal_count
-      FROM properties p
-      LEFT JOIN users u ON p.listing_broker_id = u.id
-      WHERE p.is_listing = true
-      ORDER BY p.list_date DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching listings:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.get('/api/properties/:id', authenticate, async (req, res) => {
-  try {
-    const propResult = await pool.query(`
-      SELECT p.*, u.name as listing_broker_name
-      FROM properties p LEFT JOIN users u ON p.listing_broker_id = u.id
-      WHERE p.id = $1
-    `, [req.params.id]);
-    const p = propResult.rows[0];
-    if (!p) return res.status(404).json({ error: 'Property not found' });
-
-    const inquiriesResult = await pool.query(`
-      SELECT i.*, c.first_name, c.last_name, c.email, c.phone, c.tags, co.name as company_name
-      FROM inquiries i
-      LEFT JOIN contacts c ON i.contact_id = c.id
-      LEFT JOIN companies co ON c.company_id = co.id
-      WHERE i.property_id = $1 ORDER BY i.created_at DESC
-    `, [req.params.id]);
-
-    const dealsResult = await pool.query(`
-      SELECT d.*, c.first_name, c.last_name, u.name as assigned_to_name
-      FROM deals d
-      LEFT JOIN contacts c ON d.contact_id = c.id
-      LEFT JOIN users u ON d.assigned_to = u.id
-      WHERE d.property_id = $1 ORDER BY d.created_at DESC
-    `, [req.params.id]);
-
-    const tasksResult = await pool.query('SELECT * FROM tasks WHERE property_id = $1 ORDER BY due_date', [req.params.id]);
-
-    res.json({ ...p, inquiries: inquiriesResult.rows, deals: dealsResult.rows, tasks: tasksResult.rows });
-  } catch (err) {
-    console.error('Error fetching property:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/properties', authenticate, async (req, res) => {
-  try {
-    const f = req.body;
-    const result = await pool.query(`
-      INSERT INTO properties (name, address, city, state, submarket, type, size_sf, asking_rate, rate_type, status,
-      is_listing, list_date, expiration_date, listing_broker_id, commission_rate, marketing_notes, clear_height, dock_doors, notes, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *
-    `, [f.name, f.address, f.city, f.state || 'WA', f.submarket, f.type || 'industrial', f.size_sf, f.asking_rate,
-      f.rate_type || 'NNN', f.status || 'available', f.is_listing ? true : false, f.list_date, f.expiration_date,
-      f.listing_broker_id || null, f.commission_rate, f.marketing_notes, f.clear_height, f.dock_doors, f.notes, req.user.id]);
-    const row = result.rows[0];
-    await logActivity('create', 'property', row.id, f.address, f.is_listing ? 'New listing added' : null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating property:', err);
-    res.status(500).json({ error: 'Failed to create property' });
-  }
-});
-
-app.put('/api/properties/:id', authenticate, async (req, res) => {
-  try {
-    const f = req.body;
-    await pool.query(`
-      UPDATE properties SET name=$1, address=$2, city=$3, state=$4, submarket=$5, type=$6, size_sf=$7, asking_rate=$8, rate_type=$9, status=$10,
-      is_listing=$11, list_date=$12, expiration_date=$13, listing_broker_id=$14, commission_rate=$15, marketing_notes=$16, clear_height=$17, dock_doors=$18, notes=$19, updated_at=$20
-      WHERE id=$21
-    `, [f.name, f.address, f.city, f.state, f.submarket, f.type, f.size_sf, f.asking_rate, f.rate_type, f.status,
-      f.is_listing ? true : false, f.list_date, f.expiration_date, f.listing_broker_id || null, f.commission_rate,
-      f.marketing_notes, f.clear_height, f.dock_doors, f.notes, now(), req.params.id]);
-    const result = await pool.query('SELECT * FROM properties WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-    await logActivity('update', 'property', row.id, row.address, null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating property:', err);
-    res.status(500).json({ error: 'Failed to update property' });
-  }
-});
-
-app.delete('/api/properties/:id', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT address FROM properties WHERE id = $1', [req.params.id]);
-    const p = result.rows[0];
-    await pool.query('DELETE FROM inquiries WHERE property_id = $1', [req.params.id]);
-    await pool.query('DELETE FROM properties WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'property', parseInt(req.params.id), p?.address, null, req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting property:', err);
-    res.status(500).json({ error: 'Failed to delete property' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DEALS
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/deals', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT d.*, c.first_name, c.last_name, co.name as company_name,
-      p.address as property_address, p.name as property_name,
-      u.name as assigned_to_name, u2.name as created_by_name
-      FROM deals d
-      LEFT JOIN contacts c ON d.contact_id = c.id
-      LEFT JOIN companies co ON c.company_id = co.id
-      LEFT JOIN properties p ON d.property_id = p.id
-      LEFT JOIN users u ON d.assigned_to = u.id
-      LEFT JOIN users u2 ON d.created_by = u2.id
-      ORDER BY d.updated_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching deals:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/deals', authenticate, async (req, res) => {
-  try {
-    const f = req.body;
-    if (!f.title) return res.status(400).json({ error: 'Deal title required' });
-    const result = await pool.query(`
-      INSERT INTO deals (title, stage, deal_type, contact_id, property_id, value, size_sf, close_date, notes, assigned_to, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
-    `, [f.title, f.stage || 'prospect', f.deal_type || 'lease_tenant', f.contact_id || null, f.property_id || null,
-      f.value, f.size_sf, f.close_date, f.notes, f.assigned_to || req.user.id, req.user.id]);
-    const row = result.rows[0];
-    await logActivity('create', 'deal', row.id, f.title, `Stage: ${row.stage}`, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating deal:', err);
-    res.status(500).json({ error: 'Failed to create deal' });
-  }
-});
-
-app.put('/api/deals/:id', authenticate, async (req, res) => {
-  try {
-    const oldResult = await pool.query('SELECT * FROM deals WHERE id = $1', [req.params.id]);
-    const old = oldResult.rows[0];
-    const f = req.body;
-    await pool.query(`
-      UPDATE deals SET title=$1, stage=$2, deal_type=$3, contact_id=$4, property_id=$5, value=$6, size_sf=$7, close_date=$8, notes=$9, assigned_to=$10, updated_at=$11
-      WHERE id=$12
-    `, [f.title, f.stage, f.deal_type, f.contact_id || null, f.property_id || null, f.value, f.size_sf,
-      f.close_date, f.notes, f.assigned_to, now(), req.params.id]);
-    const result = await pool.query('SELECT * FROM deals WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-
-    if (old && old.stage !== f.stage) {
-      await logActivity('stage_change', 'deal', row.id, row.title, `${old.stage} → ${f.stage}`, req.user.id);
-    } else {
-      await logActivity('update', 'deal', row.id, row.title, null, req.user.id);
-    }
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating deal:', err);
-    res.status(500).json({ error: 'Failed to update deal' });
-  }
-});
-
-app.delete('/api/deals/:id', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT title FROM deals WHERE id = $1', [req.params.id]);
-    const d = result.rows[0];
-    await pool.query('DELETE FROM deals WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'deal', parseInt(req.params.id), d?.title, null, req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting deal:', err);
-    res.status(500).json({ error: 'Failed to delete deal' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TASKS
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/tasks', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT t.*, u.name as assigned_to_name, u2.name as created_by_name,
-      c.first_name as contact_first, c.last_name as contact_last,
-      d.title as deal_title, p.address as property_address
-      FROM tasks t
-      LEFT JOIN users u ON t.assigned_to = u.id
-      LEFT JOIN users u2 ON t.created_by = u2.id
-      LEFT JOIN contacts c ON t.contact_id = c.id
-      LEFT JOIN deals d ON t.deal_id = d.id
-      LEFT JOIN properties p ON t.property_id = p.id
-      ORDER BY t.completed ASC, t.due_date ASC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching tasks:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/tasks', authenticate, async (req, res) => {
-  try {
-    const f = req.body;
-    if (!f.title) return res.status(400).json({ error: 'Task title required' });
-    const result = await pool.query(`
-      INSERT INTO tasks (title, due_date, priority, contact_id, deal_id, property_id, assigned_to, notes, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *
-    `, [f.title, f.due_date, f.priority || 'medium', f.contact_id || null, f.deal_id || null,
-      f.property_id || null, f.assigned_to || req.user.id, f.notes, req.user.id]);
-    const row = result.rows[0];
-    await logActivity('create', 'task', row.id, f.title, null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating task:', err);
-    res.status(500).json({ error: 'Failed to create task' });
-  }
-});
-
-app.put('/api/tasks/:id', authenticate, async (req, res) => {
-  try {
-    const f = req.body;
-    const oldResult = await pool.query('SELECT * FROM tasks WHERE id = $1', [req.params.id]);
-    const old = oldResult.rows[0];
-    await pool.query(`
-      UPDATE tasks SET title=$1, due_date=$2, completed=$3, priority=$4, contact_id=$5, deal_id=$6, property_id=$7, assigned_to=$8, notes=$9
-      WHERE id=$10
-    `, [f.title, f.due_date, f.completed ? true : false, f.priority, f.contact_id || null, f.deal_id || null,
-      f.property_id || null, f.assigned_to, f.notes, req.params.id]);
-    const result = await pool.query('SELECT * FROM tasks WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-
-    if (!old?.completed && f.completed) {
-      await logActivity('complete', 'task', row.id, row.title, null, req.user.id);
-    } else {
-      await logActivity('update', 'task', row.id, row.title, null, req.user.id);
-    }
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating task:', err);
-    res.status(500).json({ error: 'Failed to update task' });
-  }
-});
-
-app.delete('/api/tasks/:id', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT title FROM tasks WHERE id = $1', [req.params.id]);
-    const t = result.rows[0];
-    await pool.query('DELETE FROM tasks WHERE id = $1', [req.params.id]);
-    await logActivity('delete', 'task', parseInt(req.params.id), t?.title, null, req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting task:', err);
-    res.status(500).json({ error: 'Failed to delete task' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// INQUIRIES
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/properties/:propertyId/inquiries', authenticate, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT i.*, c.first_name, c.last_name, c.email, c.phone, c.tags, co.name as company_name
-      FROM inquiries i
-      LEFT JOIN contacts c ON i.contact_id = c.id
-      LEFT JOIN companies co ON c.company_id = co.id
-      WHERE i.property_id = $1 ORDER BY i.created_at DESC
-    `, [req.params.propertyId]);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching inquiries:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-app.post('/api/inquiries', authenticate, async (req, res) => {
-  try {
-    const { property_id, contact_id, status, interest_level, size_need, notes } = req.body;
-    if (!property_id || !contact_id) return res.status(400).json({ error: 'Property and contact required' });
-    const result = await pool.query(
-      'INSERT INTO inquiries (property_id, contact_id, status, interest_level, size_need, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [property_id, contact_id, status || 'new', interest_level || 'medium', size_need, notes, req.user.id]
-    );
-    const row = result.rows[0];
-    const contactResult = await pool.query('SELECT first_name, last_name FROM contacts WHERE id = $1', [contact_id]);
-    const contact = contactResult.rows[0];
-    const propResult = await pool.query('SELECT address FROM properties WHERE id = $1', [property_id]);
-    const prop = propResult.rows[0];
-    await logActivity('create', 'inquiry', row.id,
-      `${contact?.first_name} ${contact?.last_name || ''} → ${prop?.address}`.trim(),
-      null, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error creating inquiry:', err);
-    res.status(500).json({ error: 'Failed to create inquiry' });
-  }
-});
-
-app.put('/api/inquiries/:id', authenticate, async (req, res) => {
-  try {
-    const { status, interest_level, size_need, notes } = req.body;
-    await pool.query('UPDATE inquiries SET status=$1, interest_level=$2, size_need=$3, notes=$4, updated_at=$5 WHERE id=$6',
-      [status, interest_level, size_need, notes, now(), req.params.id]);
-    const result = await pool.query('SELECT * FROM inquiries WHERE id = $1', [req.params.id]);
-    const row = result.rows[0];
-    await logActivity('update', 'inquiry', row.id, null, `Status: ${status}`, req.user.id);
-    res.json(row);
-  } catch (err) {
-    console.error('Error updating inquiry:', err);
-    res.status(500).json({ error: 'Failed to update inquiry' });
-  }
-});
-
-app.delete('/api/inquiries/:id', authenticate, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM inquiries WHERE id = $1', [req.params.id]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Error deleting inquiry:', err);
-    res.status(500).json({ error: 'Failed to delete inquiry' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DASHBOARD / STATS
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/stats', authenticate, async (req, res) => {
-  try {
-    const totalContactsResult = await pool.query('SELECT COUNT(*) as c FROM contacts');
-    const totalPropertiesResult = await pool.query('SELECT COUNT(*) as c FROM properties');
-    const activeListingsResult = await pool.query("SELECT COUNT(*) as c FROM properties WHERE is_listing = true AND status IN ('available','under_offer')");
-    const activeDealsResult = await pool.query("SELECT COUNT(*) as c FROM deals WHERE stage NOT IN ('closed_won','closed_lost')");
-    const closedWonResult = await pool.query("SELECT COUNT(*) as c FROM deals WHERE stage = 'closed_won'");
-
-    const tasksDueTodayResult = await pool.query("SELECT COUNT(*) as c FROM tasks WHERE completed = false AND due_date = CURRENT_DATE");
-    const tasksOverdueResult = await pool.query("SELECT COUNT(*) as c FROM tasks WHERE completed = false AND due_date < CURRENT_DATE AND due_date IS NOT NULL");
-    const tasksUpcomingResult = await pool.query("SELECT COUNT(*) as c FROM tasks WHERE completed = false AND due_date > CURRENT_DATE AND due_date <= CURRENT_DATE + INTERVAL '7 days'");
-
-    const dealsByStageResult = await pool.query(`
-      SELECT stage, COUNT(*) as count,
-      COALESCE(SUM(CAST(REPLACE(REPLACE(value,'$',''),',','') AS NUMERIC)),0) as total_value
-      FROM deals WHERE stage NOT IN ('closed_won','closed_lost') GROUP BY stage
-    `);
-
-    const recentActivityResult = await pool.query(`
-      SELECT a.*, u.name as user_name
-      FROM activity_log a LEFT JOIN users u ON a.user_id = u.id
-      ORDER BY a.created_at DESC LIMIT 20
-    `);
-
-    const upcomingTasksResult = await pool.query(`
-      SELECT t.*, u.name as assigned_to_name
-      FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id
-      WHERE t.completed = false
-      ORDER BY CASE WHEN t.due_date IS NULL THEN 1 ELSE 0 END, t.due_date ASC
-      LIMIT 10
-    `);
-
-    res.json({
-      totalContacts: parseInt(totalContactsResult.rows[0].c),
-      totalProperties: parseInt(totalPropertiesResult.rows[0].c),
-      activeListings: parseInt(activeListingsResult.rows[0].c),
-      activeDeals: parseInt(activeDealsResult.rows[0].c),
-      closedWon: parseInt(closedWonResult.rows[0].c),
-      tasksDueToday: parseInt(tasksDueTodayResult.rows[0].c),
-      tasksOverdue: parseInt(tasksOverdueResult.rows[0].c),
-      tasksUpcoming: parseInt(tasksUpcomingResult.rows[0].c),
-      dealsByStage: dealsByStageResult.rows,
-      recentActivity: recentActivityResult.rows,
-      upcomingTasks: upcomingTasksResult.rows
-    });
-  } catch (err) {
-    console.error('Error fetching stats:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ACTIVITY LOG
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/activity', authenticate, async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 50;
-    const result = await pool.query(`
-      SELECT a.*, u.name as user_name
-      FROM activity_log a LEFT JOIN users u ON a.user_id = u.id
-      ORDER BY a.created_at DESC LIMIT $1
-    `, [limit]);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching activity log:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL SEARCH
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/search', authenticate, async (req, res) => {
-  try {
-    const q = req.query.q;
-    if (!q || q.length < 2) return res.json({ contacts: [], companies: [], properties: [], deals: [] });
-    const like = `%${q}%`;
-
-    const contactsResult = await pool.query(`
-      SELECT id, first_name, last_name, email, phone, tags, 'contact' as _type
-      FROM contacts WHERE first_name ILIKE $1 OR last_name ILIKE $2 OR email ILIKE $3 OR phone ILIKE $4 OR tags ILIKE $5 LIMIT 10
-    `, [like, like, like, like, like]);
-
-    const companiesResult = await pool.query(`
-      SELECT id, name, type, 'company' as _type
-      FROM companies WHERE name ILIKE $1 OR industry ILIKE $2 LIMIT 10
-    `, [like, like]);
-
-    const propertiesResult = await pool.query(`
-      SELECT id, name, address, city, type, status, 'property' as _type
-      FROM properties WHERE address ILIKE $1 OR name ILIKE $2 OR city ILIKE $3 OR submarket ILIKE $4 LIMIT 10
-    `, [like, like, like, like]);
-
-    const dealsResult = await pool.query(`
-      SELECT id, title, stage, deal_type, 'deal' as _type
-      FROM deals WHERE title ILIKE $1 LIMIT 10
-    `, [like]);
-
-    res.json({ contacts: contactsResult.rows, companies: companiesResult.rows, properties: propertiesResult.rows, deals: dealsResult.rows });
-  } catch (err) {
-    console.error('Error searching:', err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSV EXPORT
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/export/:entity', authenticate, async (req, res) => {
-  try {
-    const entity = req.params.entity;
-    let rows, filename;
-
-    if (entity === 'contacts') {
-      const result = await pool.query(`
-        SELECT c.first_name, c.last_name, co.name as company, c.email, c.phone, c.tags, c.submarket, c.size_requirement, c.industry, c.notes, c.created_at
-        FROM contacts c LEFT JOIN companies co ON c.company_id = co.id ORDER BY c.first_name
-      `);
-      rows = result.rows;
-      filename = 'contacts_export.csv';
-    } else if (entity === 'deals') {
-      const result = await pool.query(`
-        SELECT d.title, d.stage, d.deal_type, c.first_name || ' ' || COALESCE(c.last_name,'') as contact,
-        p.address as property, d.value, d.close_date, u.name as assigned_to, d.notes, d.created_at
-        FROM deals d LEFT JOIN contacts c ON d.contact_id = c.id LEFT JOIN properties p ON d.property_id = p.id
-        LEFT JOIN users u ON d.assigned_to = u.id ORDER BY d.updated_at DESC
-      `);
-      rows = result.rows;
-      filename = 'deals_export.csv';
-    } else if (entity === 'properties') {
-      const result = await pool.query(`
-        SELECT p.name, p.address, p.city, p.state, p.submarket, p.type, p.size_sf, p.asking_rate, p.rate_type,
-        p.status, p.is_listing, p.list_date, p.expiration_date, p.notes, p.created_at
-        FROM properties p ORDER BY p.address
-      `);
-      rows = result.rows;
-      filename = 'properties_export.csv';
-    } else {
-      return res.status(400).json({ error: 'Invalid entity. Use: contacts, deals, properties' });
-    }
-
-    if (!rows.length) return res.status(404).json({ error: 'No data to export' });
-
-    const headers = Object.keys(rows[0]);
-    const csv = [
-      headers.join(','),
-      ...rows.map(r => headers.map(h => {
-        const val = r[h] == null ? '' : String(r[h]);
-        return val.includes(',') || val.includes('"') || val.includes('\n') ? `"${val.replace(/"/g, '""')}"` : val;
-      }).join(','))
-    ].join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(csv);
-  } catch (err) {
-    console.error('Error exporting:', err);
-    res.status(500).json({ error: 'Export failed' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// AI CHAT PROXY
-// ═══════════════════════════════════════════════════════════════════════════════
-app.post('/api/ai/chat', authenticate, async (req, res) => {
-  try {
-    const userResult = await pool.query('SELECT claude_api_key FROM users WHERE id = $1', [req.user.id]);
-    const user = userResult.rows[0];
-    if (!user?.claude_api_key) return res.status(400).json({ error: 'No Claude API key configured. Add yours in Settings.' });
-
-    // Gather CRM context for the AI
-    const contactCountResult = await pool.query('SELECT COUNT(*) as c FROM contacts');
-    const dealCountResult = await pool.query("SELECT COUNT(*) as c FROM deals WHERE stage NOT IN ('closed_won','closed_lost')");
-    const listingCountResult = await pool.query("SELECT COUNT(*) as c FROM properties WHERE is_listing = true");
-
-    const contactCount = parseInt(contactCountResult.rows[0].c);
-    const dealCount = parseInt(dealCountResult.rows[0].c);
-    const listingCount = parseInt(listingCountResult.rows[0].c);
-
-    const { messages, context } = req.body;
-    if (!messages || !messages.length) return res.status(400).json({ error: 'No messages provided' });
-
-    let systemPrompt = `You are an AI assistant embedded in KM Team CRM, a commercial real estate CRM for brokers at Kidder Mathews specializing in the Seattle Eastside market (Bellevue, Kirkland, Redmond, Bothell, Woodinville, Issaqualmie, Snoqualmie, and north to Everett).
-
-Current CRM stats: ${contactCount} contacts, ${dealCount} active deals, ${listingCount} active listings.
-
-Help with: drafting professional emails, writing LOIs and proposals, analyzing deals and comps, creating call lists, summarizing deal status, market research, and general CRE brokerage tasks. Be concise, professional, and practical. Match a polished brokerage tone.`;
-
-    if (context) {
-      systemPrompt += `\n\nAdditional context from CRM:\n${context}`;
-    }
-
-    const payload = JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages
-    });
-
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': user.claude_api_key,
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(payload)
-      }
-    };
-
-    const apiReq = https.request(options, (apiRes) => {
-      let data = '';
-      apiRes.on('data', chunk => data += chunk);
-      apiRes.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return res.status(400).json({ error: parsed.error.message || 'API error' });
-          res.json({ content: parsed.content?.[0]?.text || '' });
-        } catch {
-          res.status(500).json({ error: 'Failed to parse AI response' });
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KM Team CRM - Kidder Mathews</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            @apply bg-slate-900 text-slate-100 font-sans;
         }
-      });
-    });
+        .modal-overlay {
+            background: rgba(0, 0, 0, 0.7);
+        }
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .no-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+        .stage-column {
+            min-width: 320px;
+            max-width: 320px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
 
-    apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
-    apiReq.write(payload);
-    apiReq.end();
-  } catch (err) {
-    console.error('Error in AI chat:', err);
-    res.status(500).json({ error: 'AI chat failed' });
-  }
-});
+    <script type="text/babel">
+        // ============================================================================
+        // GLOBAL STATE & HOOKS
+        // ============================================================================
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSV IMPORT
-// ═══════════════════════════════════════════════════════════════════════════════
+        const useAuth = () => {
+            const [user, setUser] = React.useState(null);
+            const [token, setToken] = React.useState(localStorage.getItem('token'));
+            const [loading, setLoading] = React.useState(true);
 
-function parseCSVLine(line) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    if (line[i] === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else inQuotes = !inQuotes;
-    } else if (line[i] === ',' && !inQuotes) {
-      result.push(current); current = '';
-    } else {
-      current += line[i];
-    }
-  }
-  result.push(current);
-  return result;
-}
+            React.useEffect(() => {
+                if (token) {
+                    try {
+                        const decoded = JSON.parse(atob(token.split('.')[1]));
+                        setUser(decoded);
+                    } catch {
+                        localStorage.removeItem('token');
+                        setToken(null);
+                    }
+                }
+                setLoading(false);
+            }, [token]);
 
-function parseCSV(text) {
-  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
-  const headers = parseCSVLine(lines[0]).map(h => h.trim().replace(/^"|"$/g, ''));
-  return lines.slice(1).filter(l => l.trim()).map(line => {
-    const values = parseCSVLine(line);
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = (values[i] || '').trim().replace(/^"|"$/g, ''); });
-    return obj;
-  });
-}
+            const login = (newToken) => {
+                localStorage.setItem('token', newToken);
+                setToken(newToken);
+            };
 
-// Clear data for re-import
-app.delete('/api/import/clear/:entity', authenticate, async (req, res) => {
-  try {
-    const entity = req.params.entity;
-    let count = 0;
-    if (entity === 'all') {
-      await pool.query('DELETE FROM inquiries');
-      await pool.query('DELETE FROM tasks');
-      await pool.query('DELETE FROM deals');
-      await pool.query('DELETE FROM contacts');
-      await pool.query('DELETE FROM properties');
-      await pool.query('DELETE FROM companies');
-      count = 'all';
-    } else if (entity === 'companies') {
-      const r = await pool.query('DELETE FROM companies'); count = r.rowCount;
-    } else if (entity === 'contacts') {
-      const r = await pool.query('DELETE FROM contacts'); count = r.rowCount;
-    } else if (entity === 'properties') {
-      await pool.query('DELETE FROM inquiries WHERE property_id IS NOT NULL');
-      const r = await pool.query('DELETE FROM properties'); count = r.rowCount;
-    } else if (entity === 'deals') {
-      const r = await pool.query('DELETE FROM deals'); count = r.rowCount;
-    } else if (entity === 'tasks') {
-      const r = await pool.query('DELETE FROM tasks'); count = r.rowCount;
-    } else {
-      return res.status(400).json({ error: 'Invalid entity' });
-    }
-    await logActivity('delete', entity, null, `Cleared ${count} ${entity} records`, 'Data reset for re-import', req.user.id);
-    res.json({ success: true, deleted: count });
-  } catch (err) {
-    console.error('Error clearing data:', err);
-    res.status(500).json({ error: 'Failed to clear data' });
-  }
-});
+            const logout = () => {
+                localStorage.removeItem('token');
+                setToken(null);
+                setUser(null);
+            };
 
-// Import Companies (batch)
-app.post('/api/import/companies', authenticate, async (req, res) => {
-  try {
-    const { csv } = req.body;
-    if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
-    const rows = parseCSV(csv);
-    let imported = 0, skipped = 0;
+            return { user, token, loading, login, logout };
+        };
 
-    // Get existing company names for fast dedup
-    const existingRes = await pool.query('SELECT LOWER(name) as n FROM companies');
-    const existingNames = new Set(existingRes.rows.map(r => r.n));
+        // ============================================================================
+        // API HELPERS
+        // ============================================================================
 
-    // Build batch
-    const toInsert = [];
-    for (const row of rows) {
-      const name = (row['Company Name'] || '').trim();
-      if (!name) { skipped++; continue; }
-      if (existingNames.has(name.toLowerCase())) { skipped++; continue; }
-      existingNames.add(name.toLowerCase());
-      toInsert.push([name, row['Address Line 1'] || '', row['City'] || '', row['State'] || 'WA', req.user.id]);
-    }
+        const api = {
+            request: async (method, path, data = null) => {
+                const token = localStorage.getItem('token');
+                const headers = {
+                    'Content-Type': 'application/json',
+                };
+                if (token) {
+                    headers['Authorization'] = `Bearer ${token}`;
+                }
 
-    // Insert in batches of 200
-    for (let i = 0; i < toInsert.length; i += 200) {
-      const batch = toInsert.slice(i, i + 200);
-      const placeholders = batch.map((_, idx) => {
-        const base = idx * 5;
-        return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5})`;
-      }).join(',');
-      const values = batch.flat();
-      await pool.query(`INSERT INTO companies (name, address, city, state, created_by) VALUES ${placeholders}`, values);
-      imported += batch.length;
-    }
+                const options = {
+                    method,
+                    headers,
+                };
 
-    await logActivity('import', 'company', null, `${imported} companies imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: 0, total: rows.length });
-  } catch (err) {
-    console.error('Error importing companies:', err);
-    res.status(500).json({ error: 'Import failed: ' + err.message });
-  }
-});
+                if (data) {
+                    options.body = JSON.stringify(data);
+                }
 
-// Import Contacts (batch)
-app.post('/api/import/contacts', authenticate, async (req, res) => {
-  try {
-    const { csv } = req.body;
-    if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
-    const rows = parseCSV(csv);
-    let imported = 0, skipped = 0;
+                try {
+                    const url = path.startsWith('/api/') ? path : `/api${path}`;
+                    const response = await fetch(url, options);
+                    if (response.status === 401) {
+                        localStorage.removeItem('token');
+                        window.location.reload();
+                    }
+                    const json = await response.json();
+                    return { data: json, status: response.status };
+                } catch (error) {
+                    return { error: error.message, status: 500 };
+                }
+            },
+        };
 
-    // Preload company name→id map
-    const coRes = await pool.query('SELECT id, LOWER(name) as n FROM companies');
-    const companyMap = {};
-    coRes.rows.forEach(r => { companyMap[r.n] = r.id; });
+        // ============================================================================
+        // SHARED COMPONENTS
+        // ============================================================================
 
-    // Build batch (17 fields per contact)
-    const COLS = 17;
-    const toInsert = [];
-    for (const row of rows) {
-      const firstName = (row['First Name'] || '').trim();
-      if (!firstName) { skipped++; continue; }
+        // Toast Notification
+        const Toast = ({ message, type = 'success', onClose }) => {
+            React.useEffect(() => {
+                const timer = setTimeout(onClose, 3000);
+                return () => clearTimeout(timer);
+            }, [onClose]);
 
-      const companyName = (row['Company Name'] || '').trim();
-      let companyId = companyName ? (companyMap[companyName.toLowerCase()] || null) : null;
-      // Auto-create company if missing
-      if (companyName && !companyId) {
-        const r = await pool.query('INSERT INTO companies (name, created_by) VALUES ($1,$2) RETURNING id', [companyName, req.user.id]);
-        companyId = r.rows[0].id;
-        companyMap[companyName.toLowerCase()] = companyId;
-      }
+            const bgColor = type === 'error' ? 'bg-red-600' : 'bg-green-600';
 
-      // Extract address from Notes field (e.g. "Mailing Address: 123 Main St, City, WA 98001")
-      const notes = row['Notes'] || '';
-      let buildingAddress = '';
-      let cleanNotes = notes;
-      const addrMatch = notes.match(/Mailing Address:\s*(.+)/i);
-      if (addrMatch) {
-        buildingAddress = addrMatch[1].trim();
-        cleanNotes = notes.replace(/Mailing Address:\s*.+/i, '').trim();
-      }
+            return (
+                <div className={`${bgColor} text-white px-4 py-3 rounded shadow-lg`}>
+                    {message}
+                </div>
+            );
+        };
 
-      toInsert.push([
-        firstName,
-        row['Last Name'] || '',
-        companyId,
-        row['Email Address'] || '',
-        row['Phone'] || '',
-        row['Mobile Phone'] || '',
-        (row['Contact Type'] || '').trim(),
-        row['Prospect Type'] || '',
-        row['Group(s)'] || '',
-        row['Asset Type'] || '',
-        row['Submarket'] || '',
-        row['Estimated Size'] ? `${row['Estimated Size']} ${row['Size Type'] || 'SF'}`.trim() : '',
-        row['Industry'] || '',
-        row['Property Name'] || '',
-        buildingAddress,
-        cleanNotes,
-        req.user.id
-      ]);
-    }
+        const useToast = () => {
+            const [toast, setToast] = React.useState(null);
 
-    // Insert in batches of 100
-    for (let i = 0; i < toInsert.length; i += 100) {
-      const batch = toInsert.slice(i, i + 100);
-      const placeholders = batch.map((_, idx) => {
-        const b = idx * COLS;
-        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
-      }).join(',');
-      const values = batch.flat();
-      await pool.query(`INSERT INTO contacts
-        (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by)
-        VALUES ${placeholders}`, values);
-      imported += batch.length;
-    }
+            const show = (message, type = 'success') => {
+                setToast({ message, type });
+            };
 
-    await logActivity('import', 'contact', null, `${imported} contacts imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: 0, total: rows.length });
-  } catch (err) {
-    console.error('Error importing contacts:', err);
-    res.status(500).json({ error: 'Import failed: ' + err.message });
-  }
-});
+            const close = () => {
+                setToast(null);
+            };
 
-// Import Activities as Tasks (batch)
-app.post('/api/import/activities', authenticate, async (req, res) => {
-  try {
-    const { csv } = req.body;
-    if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
-    const rows = parseCSV(csv);
-    let imported = 0, skipped = 0;
+            return { toast, show, close };
+        };
 
-    // Preload contact name→id map
-    const cRes = await pool.query('SELECT id, LOWER(first_name || \' \' || COALESCE(last_name, \'\')) as n FROM contacts');
-    const contactMap = {};
-    cRes.rows.forEach(r => { contactMap[r.n.trim()] = r.id; });
+        // Modal Component
+        const Modal = ({ isOpen, onClose, title, children, actions }) => {
+            if (!isOpen) return null;
 
-    const COLS = 7;
-    const toInsert = [];
-    for (const row of rows) {
-      const subject = (row['Subject'] || row['Activity Type'] || '').trim();
-      if (!subject) { skipped++; continue; }
+            return (
+                <div className="fixed inset-0 modal-overlay flex items-center justify-center z-50">
+                    <div className="bg-slate-800 rounded-lg shadow-lg w-full max-w-md p-6 relative">
+                        <button
+                            onClick={onClose}
+                            className="absolute top-4 right-4 text-slate-300 hover:text-slate-200"
+                        >
+                            ✕
+                        </button>
+                        <h2 className="text-xl font-bold mb-4">{title}</h2>
+                        <div className="mb-6">{children}</div>
+                        {actions && (
+                            <div className="flex gap-2 justify-end">
+                                {actions}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
 
-      const contactName = (row['Contact Name'] || '').trim().toLowerCase();
-      const contactId = contactMap[contactName] || null;
-      const isComplete = row['Is Complete'] === 'Yes' || row['Is Complete'] === '1';
-      const priority = row['Activity Type'] === 'Task' ? 'high' : 'medium';
-      const dueDate = row['Date'] || row['Completed Date'] || null;
+        // Confirm Dialog
+        const ConfirmDialog = ({ isOpen, onClose, onConfirm, title, message }) => {
+            if (!isOpen) return null;
 
-      toInsert.push([subject, dueDate, isComplete, priority, contactId, row['Notes'] || '', req.user.id]);
-    }
+            return (
+                <div className="fixed inset-0 modal-overlay flex items-center justify-center z-50">
+                    <div className="bg-slate-800 rounded-lg shadow-lg w-full max-w-sm p-6">
+                        <h2 className="text-lg font-bold mb-4">{title}</h2>
+                        <p className="text-slate-300 mb-6">{message}</p>
+                        <div className="flex gap-2 justify-end">
+                            <button
+                                onClick={onClose}
+                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={onConfirm}
+                                className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded text-white"
+                            >
+                                Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
 
-    for (let i = 0; i < toInsert.length; i += 200) {
-      const batch = toInsert.slice(i, i + 200);
-      const placeholders = batch.map((_, idx) => {
-        const b = idx * COLS;
-        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
-      }).join(',');
-      await pool.query(`INSERT INTO tasks (title, due_date, completed, priority, contact_id, notes, created_by) VALUES ${placeholders}`, batch.flat());
-      imported += batch.length;
-    }
+        // Badge Component
+        const Badge = ({ children, color = 'blue', className = '' }) => {
+            const colors = {
+                blue: 'bg-blue-600 text-white',
+                green: 'bg-green-600 text-white',
+                red: 'bg-red-600 text-white',
+                yellow: 'bg-yellow-600 text-white',
+                orange: 'bg-orange-600 text-white',
+                gray: 'bg-slate-600 text-white',
+                purple: 'bg-purple-600 text-white',
+            };
 
-    await logActivity('import', 'task', null, `${imported} activities imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: 0, total: rows.length });
-  } catch (err) {
-    console.error('Error importing activities:', err);
-    res.status(500).json({ error: 'Import failed: ' + err.message });
-  }
-});
+            return (
+                <span className={`px-2 py-1 rounded-full text-sm ${colors[color] || colors.blue} ${className}`}>
+                    {children}
+                </span>
+            );
+        };
 
-// Import Properties (batch)
-app.post('/api/import/properties', authenticate, async (req, res) => {
-  try {
-    const { csv } = req.body;
-    if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
-    const rows = parseCSV(csv);
-    let imported = 0, skipped = 0;
+        // Empty State Component
+        const EmptyState = ({ icon, title, message, action }) => (
+            <div className="text-center py-12">
+                <div className="text-4xl mb-4">{icon}</div>
+                <h3 className="text-lg font-semibold mb-2">{title}</h3>
+                <p className="text-slate-300 mb-4">{message}</p>
+                {action}
+            </div>
+        );
 
-    // Get existing property names for dedup
-    const existingRes = await pool.query('SELECT LOWER(name) as n FROM properties WHERE name IS NOT NULL');
-    const existingNames = new Set(existingRes.rows.map(r => r.n));
+        // Spinner Component
+        const Spinner = () => (
+            <div className="flex justify-center py-8">
+                <div className="w-8 h-8 border-4 border-slate-600 border-t-blue-600 rounded-full animate-spin"></div>
+            </div>
+        );
 
-    const COLS = 9;
-    const toInsert = [];
-    for (const row of rows) {
-      const propName = (row['Property Name'] || '').trim();
-      if (!propName) { skipped++; continue; }
-      if (existingNames.has(propName.toLowerCase())) { skipped++; continue; }
-      existingNames.add(propName.toLowerCase());
+        // ============================================================================
+        // AUTH PAGES
+        // ============================================================================
 
-      const address = (row['Address Line 1'] || propName).trim();
-      const sizeSf = parseInt((row['Size'] || row['Lot Size'] || '').replace(/[,\s]/g, '')) || null;
+        const SetupPage = ({ onSetupComplete }) => {
+            const [name, setName] = React.useState('');
+            const [email, setEmail] = React.useState('');
+            const [password, setPassword] = React.useState('');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
 
-      toInsert.push([
-        propName,
-        address,
-        row['City'] || '',
-        row['State'] || 'WA',
-        row['Submarket'] || '',
-        (row['Asset Type'] || row['Classification'] || '').toLowerCase() || null,
-        sizeSf,
-        row['Notes'] || '',
-        req.user.id
-      ]);
-    }
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!name || !email || !password) {
+                    show('All fields are required', 'error');
+                    return;
+                }
 
-    for (let i = 0; i < toInsert.length; i += 200) {
-      const batch = toInsert.slice(i, i + 200);
-      const placeholders = batch.map((_, idx) => {
-        const b = idx * COLS;
-        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
-      }).join(',');
-      await pool.query(`INSERT INTO properties (name, address, city, state, submarket, type, size_sf, notes, created_by) VALUES ${placeholders}`, batch.flat());
-      imported += batch.length;
-    }
+                setLoading(true);
+                const result = await api.request('POST', '/auth/setup', {
+                    name,
+                    email,
+                    password,
+                });
 
-    await logActivity('import', 'property', null, `${imported} properties imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: 0, total: rows.length });
-  } catch (err) {
-    console.error('Error importing properties:', err);
-    res.status(500).json({ error: 'Import failed: ' + err.message });
-  }
-});
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Admin account created', 'success');
+                    onSetupComplete();
+                }
+                setLoading(false);
+            };
 
-// Import Deals
-app.post('/api/import/deals', authenticate, async (req, res) => {
-  try {
-    const { csv } = req.body;
-    if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
-    const rows = parseCSV(csv);
-    let imported = 0, skipped = 0, errors = [];
+            return (
+                <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+                    <div className="bg-slate-800 rounded-lg p-8 w-full max-w-md">
+                        <div className="text-center mb-8">
+                            <div className="text-4xl mb-2">🏢</div>
+                            <h1 className="text-2xl font-bold">KM Team CRM</h1>
+                            <p className="text-slate-300 mt-2">Create your first admin account</p>
+                        </div>
 
-    // Stage mapping from CRE OneSource to our stages
-    const stageMap = {
-      'prospect': 'prospect', 'lead': 'prospect', 'new': 'prospect',
-      'touring': 'touring', 'tour': 'touring', 'showing': 'touring',
-      'loi': 'loi', 'letter of intent': 'loi', 'offer': 'loi',
-      'negotiating': 'negotiating', 'negotiation': 'negotiating', 'under contract': 'negotiating',
-      'closed': 'closed_won', 'closed won': 'closed_won', 'executed': 'closed_won', 'complete': 'closed_won',
-      'dead': 'closed_lost', 'lost': 'closed_lost', 'closed lost': 'closed_lost', 'cancelled': 'closed_lost'
-    };
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Name</label>
+                                <input
+                                    type="text"
+                                    value={name}
+                                    onChange={(e) => setName(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="Your name"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Email</label>
+                                <input
+                                    type="email"
+                                    value={email}
+                                    onChange={(e) => setEmail(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="your@email.com"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Password</label>
+                                <input
+                                    type="password"
+                                    value={password}
+                                    onChange={(e) => setPassword(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="••••••••"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded disabled:opacity-50"
+                            >
+                                {loading ? 'Creating...' : 'Create Admin Account'}
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
 
-    const dealTypeMap = {
-      'tenant rep': 'lease_tenant', 'tenant representation': 'lease_tenant',
-      'landlord rep': 'lease_landlord', 'landlord representation': 'lease_landlord',
-      'sale': 'sale', 'disposition': 'sale', 'acquisition': 'sale',
-      'sublease': 'sublease'
-    };
+        const LoginPage = ({ onLogin }) => {
+            const [email, setEmail] = React.useState('');
+            const [password, setPassword] = React.useState('');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
 
-    for (const row of rows) {
-      const title = (row['Deal Name'] || '').trim();
-      if (!title) { skipped++; continue; }
-      const existing = await pool.query('SELECT id FROM deals WHERE title = $1', [title]);
-      if (existing.rows.length > 0) { skipped++; continue; }
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!email || !password) {
+                    show('Email and password are required', 'error');
+                    return;
+                }
 
-      // Find linked contact
-      let contactId = null;
-      const contactName = (row['Primary Contact Name'] || row['Tenant Name (Tenant Rep deals only)'] || '').trim();
-      if (contactName) {
-        const parts = contactName.trim().split(' ');
-        const c = await pool.query('SELECT id FROM contacts WHERE first_name = $1 AND last_name = $2',
-          [parts[0] || '', parts.slice(1).join(' ') || '']);
-        if (c.rows.length > 0) contactId = c.rows[0].id;
-      }
+                setLoading(true);
+                const result = await api.request('POST', '/auth/login', {
+                    email,
+                    password,
+                });
 
-      // Find linked property
-      let propertyId = null;
-      const propName = (row['Property Name (Disposition or LLA deals only)'] || '').trim();
-      if (propName) {
-        const p = await pool.query('SELECT id FROM properties WHERE name = $1 OR address = $2', [propName, propName]);
-        if (p.rows.length > 0) propertyId = p.rows[0].id;
-      }
+                if (result.error) {
+                    show(result.error, 'error');
+                } else if (result.data && result.data.token) {
+                    onLogin(result.data.token);
+                }
+                setLoading(false);
+            };
 
-      const rawStage = (row['Stage'] || row['Deal Status'] || 'prospect').toLowerCase();
-      const stage = stageMap[rawStage] || 'prospect';
-      const rawType = (row['Deal Type'] || '').toLowerCase();
-      const dealType = dealTypeMap[rawType] || 'lease_tenant';
-      const value = row['Estimated Transaction Value'] || row['Actual Transaction Value'] || '';
-      const closeDate = row['Estimated Close Date'] || row['Actual Close Date'] || null;
+            return (
+                <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+                    <div className="bg-slate-800 rounded-lg p-8 w-full max-w-md">
+                        <div className="text-center mb-8">
+                            <div className="text-4xl mb-2">🏢</div>
+                            <h1 className="text-2xl font-bold">KM Team CRM</h1>
+                            <p className="text-slate-300 mt-2">Welcome back</p>
+                        </div>
 
-      try {
-        await pool.query(`INSERT INTO deals (title, stage, deal_type, contact_id, property_id, value, close_date, notes, assigned_to, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [title, stage, dealType, contactId, propertyId, value, closeDate, row['Notes'] || '', req.user.id, req.user.id]);
-        imported++;
-      } catch (e) { errors.push(title); }
-    }
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Email</label>
+                                <input
+                                    type="email"
+                                    value={email}
+                                    onChange={(e) => setEmail(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="your@email.com"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Password</label>
+                                <input
+                                    type="password"
+                                    value={password}
+                                    onChange={(e) => setPassword(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="••••••••"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded disabled:opacity-50"
+                            >
+                                {loading ? 'Signing in...' : 'Sign In'}
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
 
-    await logActivity('import', 'deal', null, `${imported} deals imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: errors.length, total: rows.length });
-  } catch (err) {
-    console.error('Error importing deals:', err);
-    res.status(500).json({ error: 'Import failed' });
-  }
-});
+        // ============================================================================
+        // DASHBOARD PAGE
+        // ============================================================================
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SPA FALLBACK — checks public/index.html then root index.html
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('*', (req, res) => {
-  const publicHtml = path.join(__dirname, 'public', 'index.html');
-  const rootHtml = path.join(__dirname, 'index.html');
-  if (fs.existsSync(publicHtml)) {
-    res.sendFile(publicHtml);
-  } else if (fs.existsSync(rootHtml)) {
-    res.sendFile(rootHtml);
-  } else {
-    res.status(404).send('index.html not found. Make sure it is in the root or public/ folder.');
-  }
-});
+        const DashboardPage = ({ onNavigate }) => {
+            const [stats, setStats] = React.useState(null);
+            const [tasks, setTasks] = React.useState([]);
+            const [activity, setActivity] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const { show } = useToast();
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// START SERVER
-// ═══════════════════════════════════════════════════════════════════════════════
-(async () => {
-  try {
-    await initializeDatabase();
-    app.listen(PORT, () => {
-      console.log(`\n  🏢 KM Team CRM running at http://localhost:${PORT}\n`);
-    });
-  } catch (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
-})();
+            React.useEffect(() => {
+                const fetchData = async () => {
+                    setLoading(true);
+                    const [statsRes, tasksRes, activityRes] = await Promise.all([
+                        api.request('GET', '/api/stats'),
+                        api.request('GET', '/api/tasks'),
+                        api.request('GET', '/api/activity'),
+                    ]);
+
+                    if (!statsRes.error) setStats(statsRes.data);
+                    if (!tasksRes.error) setTasks(tasksRes.data || []);
+                    if (!activityRes.error) setActivity(activityRes.data || []);
+                    setLoading(false);
+                };
+
+                fetchData();
+            }, []);
+
+            if (loading) return <Spinner />;
+
+            const upcomingTasks = (tasks || [])
+                .sort((a, b) => new Date(a.due_date) - new Date(b.due_date))
+                .slice(0, 5);
+
+            const recentActivity = (activity || []).slice(0, 8);
+
+            return (
+                <div className="space-y-6">
+                    {/* Stats Row */}
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                        <div className="bg-slate-800 rounded-lg p-4">
+                            <p className="text-slate-300 text-sm">Total Contacts</p>
+                            <p className="text-2xl font-bold text-blue-400">{stats?.total_contacts || 0}</p>
+                        </div>
+                        <div className="bg-slate-800 rounded-lg p-4">
+                            <p className="text-slate-300 text-sm">Active Deals</p>
+                            <p className="text-2xl font-bold text-blue-400">{stats?.active_deals || 0}</p>
+                        </div>
+                        <div className="bg-slate-800 rounded-lg p-4">
+                            <p className="text-slate-300 text-sm">Active Listings</p>
+                            <p className="text-2xl font-bold text-blue-400">{stats?.active_listings || 0}</p>
+                        </div>
+                        <div className="bg-slate-800 rounded-lg p-4">
+                            <p className="text-slate-300 text-sm">Tasks Today</p>
+                            <p className="text-2xl font-bold text-blue-400">{stats?.tasks_due_today || 0}</p>
+                        </div>
+                        <div className="bg-slate-800 rounded-lg p-4">
+                            <p className="text-slate-300 text-sm">Overdue</p>
+                            <p className={`text-2xl font-bold ${stats?.tasks_overdue > 0 ? 'text-red-400' : 'text-blue-400'}`}>
+                                {stats?.tasks_overdue || 0}
+                            </p>
+                        </div>
+                    </div>
+
+                    {/* Quick Add Buttons */}
+                    <div className="flex flex-wrap gap-2">
+                        <button
+                            onClick={() => onNavigate('contacts')}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white text-sm font-medium"
+                        >
+                            + Contact
+                        </button>
+                        <button
+                            onClick={() => onNavigate('pipeline')}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white text-sm font-medium"
+                        >
+                            + Deal
+                        </button>
+                        <button
+                            onClick={() => onNavigate('properties')}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white text-sm font-medium"
+                        >
+                            + Property
+                        </button>
+                        <button
+                            onClick={() => onNavigate('tasks')}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white text-sm font-medium"
+                        >
+                            + Task
+                        </button>
+                    </div>
+
+                    {/* Main Content Grid */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Upcoming Tasks */}
+                        <div className="lg:col-span-1 bg-slate-800 rounded-lg p-6">
+                            <h3 className="text-lg font-semibold mb-4">Upcoming Tasks</h3>
+                            {upcomingTasks.length === 0 ? (
+                                <p className="text-slate-300 text-sm">No upcoming tasks</p>
+                            ) : (
+                                <div className="space-y-2">
+                                    {upcomingTasks.map((task) => (
+                                        <div
+                                            key={task.id}
+                                            className={`p-3 rounded text-sm ${
+                                                new Date(task.due_date) < new Date()
+                                                    ? 'bg-red-900/30'
+                                                    : 'bg-slate-700'
+                                            }`}
+                                        >
+                                            <p className="font-medium">{task.title}</p>
+                                            <p className="text-xs text-slate-300">
+                                                {new Date(task.due_date).toLocaleDateString()}
+                                            </p>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Recent Activity */}
+                        <div className="lg:col-span-2 bg-slate-800 rounded-lg p-6">
+                            <h3 className="text-lg font-semibold mb-4">Recent Activity</h3>
+                            {recentActivity.length === 0 ? (
+                                <p className="text-slate-300 text-sm">No activity yet</p>
+                            ) : (
+                                <div className="space-y-3">
+                                    {recentActivity.map((item) => (
+                                        <div key={item.id} className="flex gap-3 text-sm">
+                                            <span className="text-lg">{getActivityIcon(item.action)}</span>
+                                            <div className="flex-1">
+                                                <p className="text-slate-300">{item.description}</p>
+                                                <p className="text-xs text-slate-500">
+                                                    {item.user_name} · {formatDate(item.created_at)}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================================
+        // CONTACTS PAGE
+        // ============================================================================
+
+        const ContactsPage = () => {
+            const [contacts, setContacts] = React.useState([]);
+            const [filteredContacts, setFilteredContacts] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const [showModal, setShowModal] = React.useState(false);
+            const [editingContact, setEditingContact] = React.useState(null);
+            const [searchTerm, setSearchTerm] = React.useState('');
+            const [selectedTags, setSelectedTags] = React.useState([]);
+            const [sortColumn, setSortColumn] = React.useState('name');
+            const [sortOrder, setSortOrder] = React.useState('asc');
+            const { show } = useToast();
+
+            const availableTags = ['Tenant', 'Buyer', 'Investor', 'Landlord', 'Owner', 'Seller', 'Other Broker'];
+
+            React.useEffect(() => {
+                fetchContacts();
+            }, []);
+
+            React.useEffect(() => {
+                filterAndSort();
+            }, [contacts, searchTerm, selectedTags, sortColumn, sortOrder]);
+
+            const fetchContacts = async () => {
+                setLoading(true);
+                const result = await api.request('GET', '/api/contacts');
+                if (!result.error) {
+                    setContacts(result.data || []);
+                }
+                setLoading(false);
+            };
+
+            const filterAndSort = () => {
+                let filtered = contacts.filter((contact) => {
+                    const matchesSearch =
+                        searchTerm === '' ||
+                        contact.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                        (contact.email && contact.email.toLowerCase().includes(searchTerm.toLowerCase())) ||
+                        (contact.company && contact.company.toLowerCase().includes(searchTerm.toLowerCase()));
+
+                    const matchesTags =
+                        selectedTags.length === 0 ||
+                        selectedTags.some((tag) =>
+                            (contact.tags || '')
+                                .split(',')
+                                .map((t) => t.trim())
+                                .includes(tag)
+                        );
+
+                    return matchesSearch && matchesTags;
+                });
+
+                filtered.sort((a, b) => {
+                    const aVal = a[sortColumn] || '';
+                    const bVal = b[sortColumn] || '';
+                    const comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                    return sortOrder === 'asc' ? comparison : -comparison;
+                });
+
+                setFilteredContacts(filtered);
+            };
+
+            const handleSort = (column) => {
+                if (sortColumn === column) {
+                    setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
+                } else {
+                    setSortColumn(column);
+                    setSortOrder('asc');
+                }
+            };
+
+            const handleSave = async (contactData) => {
+                let result;
+                if (editingContact) {
+                    result = await api.request('PUT', `/api/contacts/${editingContact.id}`, contactData);
+                } else {
+                    result = await api.request('POST', '/api/contacts', contactData);
+                }
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(editingContact ? 'Contact updated' : 'Contact created', 'success');
+                    setShowModal(false);
+                    setEditingContact(null);
+                    fetchContacts();
+                }
+            };
+
+            const handleDelete = async (id) => {
+                const result = await api.request('DELETE', `/api/contacts/${id}`);
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Contact deleted', 'success');
+                    fetchContacts();
+                }
+            };
+
+            if (loading) return <Spinner />;
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex justify-between items-center">
+                        <div>
+                            <h1 className="text-2xl font-bold">Contacts</h1>
+                            <p className="text-slate-300">{filteredContacts.length} contacts</p>
+                        </div>
+                        <button
+                            onClick={() => {
+                                setEditingContact(null);
+                                setShowModal(true);
+                            }}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                        >
+                            + Add Contact
+                        </button>
+                    </div>
+
+                    {/* Filters */}
+                    <div className="bg-slate-800 rounded-lg p-4 space-y-3">
+                        <input
+                            type="text"
+                            placeholder="Search by name, email, or company..."
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="w-full bg-slate-700 rounded px-3 py-2 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                        />
+                        <div className="flex flex-wrap gap-2">
+                            {availableTags.map((tag) => (
+                                <button
+                                    key={tag}
+                                    onClick={() =>
+                                        setSelectedTags(
+                                            selectedTags.includes(tag)
+                                                ? selectedTags.filter((t) => t !== tag)
+                                                : [...selectedTags, tag]
+                                        )
+                                    }
+                                    className={`px-3 py-1 rounded text-sm transition ${
+                                        selectedTags.includes(tag)
+                                            ? 'bg-blue-600 text-white'
+                                            : 'bg-slate-700 text-slate-300'
+                                    }`}
+                                >
+                                    {tag}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Contacts Table */}
+                    {filteredContacts.length === 0 ? (
+                        <EmptyState
+                            icon="👥"
+                            title="No contacts found"
+                            message="Start by creating your first contact or adjust your filters."
+                            action={
+                                <button
+                                    onClick={() => {
+                                        setEditingContact(null);
+                                        setShowModal(true);
+                                    }}
+                                    className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                                >
+                                    Add Contact
+                                </button>
+                            }
+                        />
+                    ) : (
+                        <div className="bg-slate-800 rounded-lg overflow-x-auto">
+                            <table className="w-full">
+                                <thead className="bg-slate-700">
+                                    <tr>
+                                        <th
+                                            onClick={() => handleSort('name')}
+                                            className="px-4 py-3 text-left font-semibold cursor-pointer hover:bg-slate-600"
+                                        >
+                                            Name {sortColumn === 'name' && (sortOrder === 'asc' ? '↑' : '↓')}
+                                        </th>
+                                        <th
+                                            onClick={() => handleSort('company')}
+                                            className="px-4 py-3 text-left font-semibold cursor-pointer hover:bg-slate-600"
+                                        >
+                                            Company {sortColumn === 'company' && (sortOrder === 'asc' ? '↑' : '↓')}
+                                        </th>
+                                                        <th className="px-4 py-3 text-left font-semibold">Email</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Direct</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Mobile</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Prospect Type</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Submarket</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {filteredContacts.map((contact) => (
+                                        <tr key={contact.id} className="border-t border-slate-700 hover:bg-slate-700/50">
+                                            <td className="px-4 py-3 font-medium">{contact.first_name} {contact.last_name || ''}</td>
+                                            <td className="px-4 py-3 text-slate-300">{contact.company || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.email || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.phone || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.mobile_phone || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.prospect_type || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-300 text-sm">{contact.submarket || '-'}</td>
+                                            <td className="px-4 py-3 text-sm">
+                                                <button
+                                                    onClick={() => {
+                                                        setEditingContact(contact);
+                                                        setShowModal(true);
+                                                    }}
+                                                    className="text-blue-400 hover:text-blue-300 mr-3"
+                                                >
+                                                    Edit
+                                                </button>
+                                                <button
+                                                    onClick={() => handleDelete(contact.id)}
+                                                    className="text-red-400 hover:text-red-300"
+                                                >
+                                                    Delete
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+
+                    <ContactModal
+                        isOpen={showModal}
+                        onClose={() => {
+                            setShowModal(false);
+                            setEditingContact(null);
+                        }}
+                        onSave={handleSave}
+                        initialData={editingContact}
+                    />
+                </div>
+            );
+        };
+
+        const ContactModal = ({ isOpen, onClose, onSave, initialData }) => {
+            const empty = { first_name:'', last_name:'', email:'', phone:'', mobile_phone:'', company_name:'', tags:'', prospect_type:'', group_dot:'', asset_type:'', submarket:'', size_requirement:'', industry:'', building_name:'', building_address:'', notes:'' };
+            const [form, setForm] = React.useState(empty);
+            const [companies, setCompanies] = React.useState([]);
+            const { show } = useToast();
+
+            const contactTypes = ['Tenant', 'Buyer', 'Investor', 'Landlord', 'Owner', 'Seller', 'Other Broker'];
+            const prospectTypes = ['Tenant Rep', 'Landlord Rep', 'Buyer', 'Seller', 'Investor', 'Owner/User'];
+            const assetTypes = ['Industrial', 'Office', 'Flex/R&D', 'Land', 'Retail', 'Multi-Family'];
+            const submarkets = ['Bellevue', 'Kirkland', 'Redmond', 'Bothell', 'Woodinville', 'Issaquah', 'Snoqualmie', 'Everett', 'Renton', 'Kent', 'Auburn', 'Seattle', 'Other'];
+
+            React.useEffect(() => {
+                api.request('GET', '/api/companies').then(r => { if (!r.error) setCompanies(r.data || []); });
+            }, []);
+
+            React.useEffect(() => {
+                if (initialData) {
+                    setForm({
+                        first_name: initialData.first_name || '',
+                        last_name: initialData.last_name || '',
+                        email: initialData.email || '',
+                        phone: initialData.phone || '',
+                        mobile_phone: initialData.mobile_phone || '',
+                        company_name: initialData.company_name || initialData.company || '',
+                        company_id: initialData.company_id || '',
+                        tags: initialData.tags || '',
+                        prospect_type: initialData.prospect_type || '',
+                        group_dot: initialData.group_dot || '',
+                        asset_type: initialData.asset_type || '',
+                        submarket: initialData.submarket || '',
+                        size_requirement: initialData.size_requirement || '',
+                        industry: initialData.industry || '',
+                        building_name: initialData.building_name || '',
+                        building_address: initialData.building_address || '',
+                        notes: initialData.notes || '',
+                    });
+                } else {
+                    setForm(empty);
+                }
+            }, [initialData, isOpen]);
+
+            const set = (field) => (e) => setForm(f => ({ ...f, [field]: e.target.value }));
+            const toggleTag = (tag) => setForm(f => {
+                const current = f.tags.split(',').map(t => t.trim()).filter(Boolean);
+                const next = current.includes(tag) ? current.filter(t => t !== tag) : [...current, tag];
+                return { ...f, tags: next.join(', ') };
+            });
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!form.first_name.trim()) { show('First name required', 'error'); return; }
+                // Resolve company_id from name
+                const matchedCo = companies.find(c => c.name === form.company_name);
+                onSave({ ...form, company_id: matchedCo?.id || null });
+            };
+
+            const activeTags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
+            const input = (label, field, opts = {}) => (
+                <div>
+                    <label className="block text-xs text-slate-300 mb-1">{label}</label>
+                    <input type={opts.type || 'text'} value={form[field]} onChange={set(field)}
+                        placeholder={opts.placeholder || ''}
+                        className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                </div>
+            );
+            const select = (label, field, options) => (
+                <div>
+                    <label className="block text-xs text-slate-300 mb-1">{label}</label>
+                    <select value={form[field]} onChange={set(field)}
+                        className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600">
+                        <option value="">— Select —</option>
+                        {options.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                </div>
+            );
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} title={initialData ? 'Edit Contact' : 'New Contact'}
+                    actions={<>
+                        <button onClick={onClose} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+                        <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white text-sm">Save</button>
+                    </>}
+                >
+                    <form className="space-y-4" onSubmit={handleSubmit}>
+                        {/* Name row */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('First Name *', 'first_name', { placeholder: 'First' })}
+                            {input('Last Name', 'last_name', { placeholder: 'Last' })}
+                        </div>
+
+                        {/* Contact info */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Direct Phone', 'phone', { type: 'tel', placeholder: '(206) 555-1234' })}
+                            {input('Mobile Phone', 'mobile_phone', { type: 'tel', placeholder: '(206) 555-5678' })}
+                        </div>
+                        {input('Email', 'email', { type: 'email', placeholder: 'email@example.com' })}
+
+                        {/* Company */}
+                        <div>
+                            <label className="block text-xs text-slate-300 mb-1">Company</label>
+                            <input list="company-list" value={form.company_name} onChange={set('company_name')}
+                                placeholder="Type or select a company"
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            <datalist id="company-list">
+                                {companies.map(c => <option key={c.id} value={c.name} />)}
+                            </datalist>
+                        </div>
+
+                        {/* Classification */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {select('Prospect Type', 'prospect_type', prospectTypes)}
+                            {select('Asset Type', 'asset_type', assetTypes)}
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            {select('Submarket', 'submarket', submarkets)}
+                            {input('Estimated Size', 'size_requirement', { placeholder: '5,000 SF' })}
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Industry', 'industry', { placeholder: 'e.g. Construction' })}
+                            {input('Group/Dot', 'group_dot', { placeholder: 'CRE OneSource group' })}
+                        </div>
+
+                        {/* Building info */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Building Name', 'building_name', { placeholder: 'e.g. Redmond Town Center' })}
+                            {input('Building Address', 'building_address', { placeholder: 'Street address' })}
+                        </div>
+
+                        {/* Contact type tags */}
+                        <div>
+                            <label className="block text-xs text-slate-300 mb-2">Contact Type (select all that apply)</label>
+                            <div className="flex flex-wrap gap-2">
+                                {contactTypes.map(tag => (
+                                    <button key={tag} type="button" onClick={() => toggleTag(tag)}
+                                        className={`px-3 py-1 rounded text-xs transition ${activeTags.includes(tag) ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300'}`}>
+                                        {tag}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Notes */}
+                        <div>
+                            <label className="block text-xs text-slate-300 mb-1">Notes / Activities</label>
+                            <textarea value={form.notes} onChange={set('notes')} rows={3}
+                                placeholder="Notes, activity history..."
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600 resize-none" />
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // ============================================================================
+        // PIPELINE PAGE (KANBAN)
+        // ============================================================================
+
+        const PipelinePage = () => {
+            const [deals, setDeals] = React.useState([]);
+            const [contacts, setContacts] = React.useState([]);
+            const [properties, setProperties] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const [showModal, setShowModal] = React.useState(false);
+            const [editingDeal, setEditingDeal] = React.useState(null);
+            const { show } = useToast();
+
+            const stages = ['Prospect', 'Touring', 'LOI', 'Negotiating', 'Closed Won', 'Closed Lost'];
+
+            React.useEffect(() => {
+                fetchData();
+            }, []);
+
+            const fetchData = async () => {
+                setLoading(true);
+                const [dealsRes, contactsRes, propertiesRes] = await Promise.all([
+                    api.request('GET', '/api/deals'),
+                    api.request('GET', '/api/contacts'),
+                    api.request('GET', '/api/properties'),
+                ]);
+
+                if (!dealsRes.error) setDeals(dealsRes.data || []);
+                if (!contactsRes.error) setContacts(contactsRes.data || []);
+                if (!propertiesRes.error) setProperties(propertiesRes.data || []);
+                setLoading(false);
+            };
+
+            const dealsByStage = (stage) => {
+                return deals.filter((d) => d.stage === stage);
+            };
+
+            const totalValueByStage = (stage) => {
+                return dealsByStage(stage).reduce((sum, d) => sum + (d.value || 0), 0);
+            };
+
+            const handleSave = async (dealData) => {
+                let result;
+                if (editingDeal) {
+                    result = await api.request('PUT', `/api/deals/${editingDeal.id}`, dealData);
+                } else {
+                    result = await api.request('POST', '/api/deals', dealData);
+                }
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(editingDeal ? 'Deal updated' : 'Deal created', 'success');
+                    setShowModal(false);
+                    setEditingDeal(null);
+                    fetchData();
+                }
+            };
+
+            const handleMoveStage = async (deal, direction) => {
+                const currentIdx = stages.indexOf(deal.stage);
+                let newStage = deal.stage;
+
+                if (direction === 'forward' && currentIdx < stages.length - 1) {
+                    newStage = stages[currentIdx + 1];
+                } else if (direction === 'backward' && currentIdx > 0) {
+                    newStage = stages[currentIdx - 1];
+                }
+
+                const result = await api.request('PUT', `/api/deals/${deal.id}`, {
+                    ...deal,
+                    stage: newStage,
+                });
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    fetchData();
+                }
+            };
+
+            const handleDelete = async (id) => {
+                const result = await api.request('DELETE', `/api/deals/${id}`);
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Deal deleted', 'success');
+                    fetchData();
+                }
+            };
+
+            const stageColors = {
+                Prospect: 'border-gray-500',
+                Touring: 'border-blue-500',
+                LOI: 'border-yellow-500',
+                Negotiating: 'border-orange-500',
+                'Closed Won': 'border-green-500',
+                'Closed Lost': 'border-red-500',
+            };
+
+            if (loading) return <Spinner />;
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex justify-between items-center">
+                        <h1 className="text-2xl font-bold">Pipeline</h1>
+                        <button
+                            onClick={() => {
+                                setEditingDeal(null);
+                                setShowModal(true);
+                            }}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                        >
+                            + Add Deal
+                        </button>
+                    </div>
+
+                    {/* Kanban Board */}
+                    <div className="overflow-x-auto no-scrollbar pb-4">
+                        <div className="flex gap-4 min-w-max">
+                            {stages.map((stage) => {
+                                const stageDeals = dealsByStage(stage);
+                                return (
+                                    <div key={stage} className="stage-column bg-slate-800 rounded-lg p-4">
+                                        <div className="mb-4">
+                                            <h3 className="font-semibold">{stage}</h3>
+                                            <div className="flex justify-between text-xs text-slate-300 mt-1">
+                                                <span>{stageDeals.length} deals</span>
+                                                <span>${(totalValueByStage(stage) / 1000000).toFixed(1)}M</span>
+                                            </div>
+                                        </div>
+
+                                        <div className="space-y-2">
+                                            {stageDeals.map((deal) => (
+                                                <div
+                                                    key={deal.id}
+                                                    className={`bg-slate-700 border-l-4 rounded p-3 text-sm hover:bg-slate-600 transition ${stageColors[stage]}`}
+                                                >
+                                                    <p className="font-medium text-white">{deal.title}</p>
+                                                    <p className="text-xs text-slate-300 mt-1">
+                                                        {
+                                                            contacts.find((c) => c.id === deal.contact_id)
+                                                                ?.name
+                                                        }
+                                                    </p>
+                                                    <p className="text-xs text-slate-300">
+                                                        {
+                                                            properties.find((p) => p.id === deal.property_id)
+                                                                ?.address
+                                                        }
+                                                    </p>
+                                                    <p className="text-xs font-semibold text-blue-400 mt-2">
+                                                        ${(deal.value || 0).toLocaleString()}
+                                                    </p>
+
+                                                    <div className="flex gap-2 mt-3 text-xs">
+                                                        {stage !== 'Prospect' && (
+                                                            <button
+                                                                onClick={() => handleMoveStage(deal, 'backward')}
+                                                                className="text-slate-300 hover:text-white"
+                                                            >
+                                                                ← Back
+                                                            </button>
+                                                        )}
+                                                        {stage !== 'Closed Lost' && stage !== 'Closed Won' && (
+                                                            <button
+                                                                onClick={() => handleMoveStage(deal, 'forward')}
+                                                                className="text-slate-300 hover:text-white"
+                                                            >
+                                                                Forward →
+                                                            </button>
+                                                        )}
+                                                    </div>
+
+                                                    <div className="flex gap-2 mt-2 text-xs">
+                                                        <button
+                                                            onClick={() => {
+                                                                setEditingDeal(deal);
+                                                                setShowModal(true);
+                                                            }}
+                                                            className="text-blue-400 hover:text-blue-300"
+                                                        >
+                                                            Edit
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleDelete(deal.id)}
+                                                            className="text-red-400 hover:text-red-300"
+                                                        >
+                                                            Delete
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    <DealModal
+                        isOpen={showModal}
+                        onClose={() => {
+                            setShowModal(false);
+                            setEditingDeal(null);
+                        }}
+                        onSave={handleSave}
+                        initialData={editingDeal}
+                        contacts={contacts}
+                        properties={properties}
+                    />
+                </div>
+            );
+        };
+
+        const DealModal = ({ isOpen, onClose, onSave, initialData, contacts, properties }) => {
+            const [title, setTitle] = React.useState('');
+            const [stage, setStage] = React.useState('Prospect');
+            const [dealType, setDealType] = React.useState('lease_tenant');
+            const [contactId, setContactId] = React.useState('');
+            const [propertyId, setPropertyId] = React.useState('');
+            const [value, setValue] = React.useState('');
+            const [closureDate, setClosureDate] = React.useState('');
+
+            React.useEffect(() => {
+                if (initialData) {
+                    setTitle(initialData.title || '');
+                    setStage(initialData.stage || 'Prospect');
+                    setDealType(initialData.deal_type || 'lease_tenant');
+                    setContactId(initialData.contact_id || '');
+                    setPropertyId(initialData.property_id || '');
+                    setValue((initialData.value || '').toString());
+                    setClosureDate(initialData.closure_date || '');
+                } else {
+                    setTitle('');
+                    setStage('Prospect');
+                    setDealType('lease_tenant');
+                    setContactId('');
+                    setPropertyId('');
+                    setValue('');
+                    setClosureDate('');
+                }
+            }, [initialData, isOpen]);
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                onSave({
+                    title,
+                    stage,
+                    deal_type: dealType,
+                    contact_id: contactId || null,
+                    property_id: propertyId || null,
+                    value: value ? parseInt(value) : 0,
+                    closure_date: closureDate || null,
+                });
+            };
+
+            return (
+                <Modal
+                    isOpen={isOpen}
+                    onClose={onClose}
+                    title={initialData ? 'Edit Deal' : 'New Deal'}
+                    actions={
+                        <>
+                            <button
+                                onClick={onClose}
+                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleSubmit}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
+                            >
+                                Save
+                            </button>
+                        </>
+                    }
+                >
+                    <form className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Title</label>
+                            <input
+                                type="text"
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="Deal title"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Stage</label>
+                            <select
+                                value={stage}
+                                onChange={(e) => setStage(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                {['Prospect', 'Touring', 'LOI', 'Negotiating', 'Closed Won', 'Closed Lost'].map((s) => (
+                                    <option key={s} value={s}>
+                                        {s}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Deal Type</label>
+                            <select
+                                value={dealType}
+                                onChange={(e) => setDealType(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="lease_tenant">Lease - Tenant</option>
+                                <option value="lease_landlord">Lease - Landlord</option>
+                                <option value="sale">Sale</option>
+                                <option value="sublease">Sublease</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Contact</label>
+                            <select
+                                value={contactId}
+                                onChange={(e) => setContactId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">Select contact</option>
+                                {contacts.map((c) => (
+                                    <option key={c.id} value={c.id}>
+                                        {c.name}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Property</label>
+                            <select
+                                value={propertyId}
+                                onChange={(e) => setPropertyId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">Select property</option>
+                                {properties.map((p) => (
+                                    <option key={p.id} value={p.id}>
+                                        {p.address}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Value ($)</label>
+                            <input
+                                type="number"
+                                value={value}
+                                onChange={(e) => setValue(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="0"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Expected Close Date</label>
+                            <input
+                                type="date"
+                                value={closureDate}
+                                onChange={(e) => setClosureDate(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            />
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // ============================================================================
+        // PROPERTIES PAGE
+        // ============================================================================
+
+        const PropertiesPage = () => {
+            const [properties, setProperties] = React.useState([]);
+            const [filteredProperties, setFilteredProperties] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const [showModal, setShowModal] = React.useState(false);
+            const [editingProperty, setEditingProperty] = React.useState(null);
+            const [searchTerm, setSearchTerm] = React.useState('');
+            const [filterType, setFilterType] = React.useState('');
+            const [filterStatus, setFilterStatus] = React.useState('');
+            const [sortColumn, setSortColumn] = React.useState('address');
+            const [sortOrder, setSortOrder] = React.useState('asc');
+            const { show } = useToast();
+
+            React.useEffect(() => {
+                fetchProperties();
+            }, []);
+
+            React.useEffect(() => {
+                filterAndSort();
+            }, [properties, searchTerm, filterType, filterStatus, sortColumn, sortOrder]);
+
+            const fetchProperties = async () => {
+                setLoading(true);
+                const result = await api.request('GET', '/api/properties');
+                if (!result.error) {
+                    setProperties(result.data || []);
+                }
+                setLoading(false);
+            };
+
+            const filterAndSort = () => {
+                let filtered = properties.filter((prop) => {
+                    const matchesSearch =
+                        searchTerm === '' ||
+                        (prop.address && prop.address.toLowerCase().includes(searchTerm.toLowerCase()));
+
+                    const matchesType = filterType === '' || prop.property_type === filterType;
+                    const matchesStatus = filterStatus === '' || prop.status === filterStatus;
+
+                    return matchesSearch && matchesType && matchesStatus;
+                });
+
+                filtered.sort((a, b) => {
+                    const aVal = a[sortColumn] || '';
+                    const bVal = b[sortColumn] || '';
+                    const comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                    return sortOrder === 'asc' ? comparison : -comparison;
+                });
+
+                setFilteredProperties(filtered);
+            };
+
+            const handleSort = (column) => {
+                if (sortColumn === column) {
+                    setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
+                } else {
+                    setSortColumn(column);
+                    setSortOrder('asc');
+                }
+            };
+
+            const handleSave = async (propData) => {
+                let result;
+                if (editingProperty) {
+                    result = await api.request('PUT', `/api/properties/${editingProperty.id}`, propData);
+                } else {
+                    result = await api.request('POST', '/api/properties', propData);
+                }
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(editingProperty ? 'Property updated' : 'Property created', 'success');
+                    setShowModal(false);
+                    setEditingProperty(null);
+                    fetchProperties();
+                }
+            };
+
+            const handleDelete = async (id) => {
+                const result = await api.request('DELETE', `/api/properties/${id}`);
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Property deleted', 'success');
+                    fetchProperties();
+                }
+            };
+
+            if (loading) return <Spinner />;
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex justify-between items-center">
+                        <div>
+                            <h1 className="text-2xl font-bold">Properties</h1>
+                            <p className="text-slate-300">{filteredProperties.length} properties</p>
+                        </div>
+                        <button
+                            onClick={() => {
+                                setEditingProperty(null);
+                                setShowModal(true);
+                            }}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                        >
+                            + Add Property
+                        </button>
+                    </div>
+
+                    {/* Filters */}
+                    <div className="bg-slate-800 rounded-lg p-4 space-y-3">
+                        <input
+                            type="text"
+                            placeholder="Search by address..."
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="w-full bg-slate-700 rounded px-3 py-2 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                        />
+                        <div className="grid grid-cols-2 gap-3">
+                            <select
+                                value={filterType}
+                                onChange={(e) => setFilterType(e.target.value)}
+                                className="bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">All Types</option>
+                                <option value="industrial">Industrial</option>
+                                <option value="office">Office</option>
+                                <option value="retail">Retail</option>
+                                <option value="mixed">Mixed Use</option>
+                                <option value="land">Land</option>
+                            </select>
+                            <select
+                                value={filterStatus}
+                                onChange={(e) => setFilterStatus(e.target.value)}
+                                className="bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">All Status</option>
+                                <option value="available">Available</option>
+                                <option value="leased">Leased</option>
+                                <option value="pending">Pending</option>
+                                <option value="sold">Sold</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* Properties Table */}
+                    {filteredProperties.length === 0 ? (
+                        <EmptyState
+                            icon="🏢"
+                            title="No properties found"
+                            message="Start by adding your first property."
+                            action={
+                                <button
+                                    onClick={() => {
+                                        setEditingProperty(null);
+                                        setShowModal(true);
+                                    }}
+                                    className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                                >
+                                    Add Property
+                                </button>
+                            }
+                        />
+                    ) : (
+                        <div className="bg-slate-800 rounded-lg overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead className="bg-slate-700">
+                                    <tr>
+                                        <th
+                                            onClick={() => handleSort('address')}
+                                            className="px-4 py-3 text-left font-semibold cursor-pointer hover:bg-slate-600"
+                                        >
+                                            Address {sortColumn === 'address' && (sortOrder === 'asc' ? '↑' : '↓')}
+                                        </th>
+                                        <th className="px-4 py-3 text-left font-semibold">Type</th>
+                                        <th className="px-4 py-3 text-left font-semibold">SF</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Rate</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Status</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Listing</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {filteredProperties.map((prop) => (
+                                        <tr key={prop.id} className="border-t border-slate-700 hover:bg-slate-700/50">
+                                            <td className="px-4 py-3">{prop.address}</td>
+                                            <td className="px-4 py-3 text-slate-300">{prop.property_type}</td>
+                                            <td className="px-4 py-3 text-slate-300">
+                                                {(prop.size_sf || 0).toLocaleString()} SF
+                                            </td>
+                                            <td className="px-4 py-3 text-slate-300">
+                                                ${(prop.asking_rate || 0).toFixed(2)}/SF
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                <Badge color="blue">{prop.status}</Badge>
+                                            </td>
+                                            <td className="px-4 py-3">{prop.is_listing ? '✓' : '-'}</td>
+                                            <td className="px-4 py-3 text-sm">
+                                                <button
+                                                    onClick={() => {
+                                                        setEditingProperty(prop);
+                                                        setShowModal(true);
+                                                    }}
+                                                    className="text-blue-400 hover:text-blue-300 mr-3"
+                                                >
+                                                    Edit
+                                                </button>
+                                                <button
+                                                    onClick={() => handleDelete(prop.id)}
+                                                    className="text-red-400 hover:text-red-300"
+                                                >
+                                                    Delete
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+
+                    <PropertyModal
+                        isOpen={showModal}
+                        onClose={() => {
+                            setShowModal(false);
+                            setEditingProperty(null);
+                        }}
+                        onSave={handleSave}
+                        initialData={editingProperty}
+                    />
+                </div>
+            );
+        };
+
+        const PropertyModal = ({ isOpen, onClose, onSave, initialData }) => {
+            const [address, setAddress] = React.useState('');
+            const [city, setCity] = React.useState('');
+            const [propertyType, setPropertyType] = React.useState('industrial');
+            const [sizeSf, setSizeSf] = React.useState('');
+            const [askingRate, setAskingRate] = React.useState('');
+            const [status, setStatus] = React.useState('available');
+            const [isListing, setIsListing] = React.useState(false);
+
+            React.useEffect(() => {
+                if (initialData) {
+                    setAddress(initialData.address || '');
+                    setCity(initialData.city || '');
+                    setPropertyType(initialData.property_type || 'industrial');
+                    setSizeSf((initialData.size_sf || '').toString());
+                    setAskingRate((initialData.asking_rate || '').toString());
+                    setStatus(initialData.status || 'available');
+                    setIsListing(initialData.is_listing || false);
+                } else {
+                    setAddress('');
+                    setCity('');
+                    setPropertyType('industrial');
+                    setSizeSf('');
+                    setAskingRate('');
+                    setStatus('available');
+                    setIsListing(false);
+                }
+            }, [initialData, isOpen]);
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                onSave({
+                    address,
+                    city,
+                    property_type: propertyType,
+                    size_sf: sizeSf ? parseInt(sizeSf) : 0,
+                    asking_rate: askingRate ? parseFloat(askingRate) : 0,
+                    status,
+                    is_listing: isListing,
+                });
+            };
+
+            return (
+                <Modal
+                    isOpen={isOpen}
+                    onClose={onClose}
+                    title={initialData ? 'Edit Property' : 'New Property'}
+                    actions={
+                        <>
+                            <button
+                                onClick={onClose}
+                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleSubmit}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
+                            >
+                                Save
+                            </button>
+                        </>
+                    }
+                >
+                    <form className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Address</label>
+                            <input
+                                type="text"
+                                value={address}
+                                onChange={(e) => setAddress(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="123 Main St"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">City</label>
+                            <input
+                                type="text"
+                                value={city}
+                                onChange={(e) => setCity(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="Seattle"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Property Type</label>
+                            <select
+                                value={propertyType}
+                                onChange={(e) => setPropertyType(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="industrial">Industrial</option>
+                                <option value="office">Office</option>
+                                <option value="retail">Retail</option>
+                                <option value="mixed">Mixed Use</option>
+                                <option value="land">Land</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Size (SF)</label>
+                            <input
+                                type="number"
+                                value={sizeSf}
+                                onChange={(e) => setSizeSf(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="10000"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Asking Rate ($/SF)</label>
+                            <input
+                                type="number"
+                                step="0.01"
+                                value={askingRate}
+                                onChange={(e) => setAskingRate(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="15.00"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Status</label>
+                            <select
+                                value={status}
+                                onChange={(e) => setStatus(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="available">Available</option>
+                                <option value="leased">Leased</option>
+                                <option value="pending">Pending</option>
+                                <option value="sold">Sold</option>
+                            </select>
+                        </div>
+                        <div className="flex items-center">
+                            <input
+                                type="checkbox"
+                                id="isListing"
+                                checked={isListing}
+                                onChange={(e) => setIsListing(e.target.checked)}
+                                className="mr-2"
+                            />
+                            <label htmlFor="isListing" className="text-sm">
+                                This is a listing
+                            </label>
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // ============================================================================
+        // TASKS PAGE
+        // ============================================================================
+
+        const TasksPage = () => {
+            const [tasks, setTasks] = React.useState([]);
+            const [filteredTasks, setFilteredTasks] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const [showModal, setShowModal] = React.useState(false);
+            const [editingTask, setEditingTask] = React.useState(null);
+            const [filterView, setFilterView] = React.useState('all');
+            const [sortColumn, setSortColumn] = React.useState('due_date');
+            const [sortOrder, setSortOrder] = React.useState('asc');
+            const { show } = useToast();
+
+            React.useEffect(() => {
+                fetchTasks();
+            }, []);
+
+            React.useEffect(() => {
+                filterAndSort();
+            }, [tasks, filterView, sortColumn, sortOrder]);
+
+            const fetchTasks = async () => {
+                setLoading(true);
+                const result = await api.request('GET', '/api/tasks');
+                if (!result.error) {
+                    setTasks(result.data || []);
+                }
+                setLoading(false);
+            };
+
+            const filterAndSort = () => {
+                const now = new Date();
+                const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+                let filtered = tasks.filter((task) => {
+                    const taskDate = new Date(task.due_date);
+                    const taskDayStart = new Date(
+                        taskDate.getFullYear(),
+                        taskDate.getMonth(),
+                        taskDate.getDate()
+                    );
+
+                    switch (filterView) {
+                        case 'my':
+                            return true;
+                        case 'overdue':
+                            return taskDayStart < today && !task.completed;
+                        case 'today':
+                            return taskDayStart.getTime() === today.getTime();
+                        case 'week':
+                            const weekEnd = new Date(today);
+                            weekEnd.setDate(weekEnd.getDate() + 7);
+                            return taskDayStart >= today && taskDayStart <= weekEnd;
+                        default:
+                            return true;
+                    }
+                });
+
+                filtered.sort((a, b) => {
+                    const aVal = sortColumn === 'due_date' ? new Date(a.due_date) : a[sortColumn] || '';
+                    const bVal = sortColumn === 'due_date' ? new Date(b.due_date) : b[sortColumn] || '';
+                    const comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                    return sortOrder === 'asc' ? comparison : -comparison;
+                });
+
+                setFilteredTasks(filtered);
+            };
+
+            const handleToggleComplete = async (task) => {
+                const result = await api.request('PUT', `/api/tasks/${task.id}`, {
+                    ...task,
+                    completed: !task.completed,
+                });
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    fetchTasks();
+                }
+            };
+
+            const handleSave = async (taskData) => {
+                let result;
+                if (editingTask) {
+                    result = await api.request('PUT', `/api/tasks/${editingTask.id}`, taskData);
+                } else {
+                    result = await api.request('POST', '/api/tasks', taskData);
+                }
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(editingTask ? 'Task updated' : 'Task created', 'success');
+                    setShowModal(false);
+                    setEditingTask(null);
+                    fetchTasks();
+                }
+            };
+
+            const handleDelete = async (id) => {
+                const result = await api.request('DELETE', `/api/tasks/${id}`);
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Task deleted', 'success');
+                    fetchTasks();
+                }
+            };
+
+            const getPriorityColor = (priority) => {
+                switch (priority) {
+                    case 'high':
+                        return 'red';
+                    case 'medium':
+                        return 'yellow';
+                    case 'low':
+                        return 'gray';
+                    default:
+                        return 'blue';
+                }
+            };
+
+            if (loading) return <Spinner />;
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex justify-between items-center">
+                        <h1 className="text-2xl font-bold">Tasks</h1>
+                        <button
+                            onClick={() => {
+                                setEditingTask(null);
+                                setShowModal(true);
+                            }}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                        >
+                            + Add Task
+                        </button>
+                    </div>
+
+                    {/* Filter Tabs */}
+                    <div className="flex gap-2 flex-wrap">
+                        {['all', 'my', 'overdue', 'today', 'week'].map((view) => (
+                            <button
+                                key={view}
+                                onClick={() => setFilterView(view)}
+                                className={`px-4 py-2 rounded text-sm font-medium transition ${
+                                    filterView === view
+                                        ? 'bg-blue-600 text-white'
+                                        : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                                }`}
+                            >
+                                {view === 'all'
+                                    ? 'All Tasks'
+                                    : view === 'my'
+                                      ? 'My Tasks'
+                                      : view === 'overdue'
+                                        ? 'Overdue'
+                                        : view === 'today'
+                                          ? 'Due Today'
+                                          : 'This Week'}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Tasks List */}
+                    {filteredTasks.length === 0 ? (
+                        <EmptyState
+                            icon="✓"
+                            title="No tasks found"
+                            message="Great! No tasks match your filters."
+                            action={
+                                <button
+                                    onClick={() => {
+                                        setEditingTask(null);
+                                        setShowModal(true);
+                                    }}
+                                    className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white"
+                                >
+                                    Add Task
+                                </button>
+                            }
+                        />
+                    ) : (
+                        <div className="space-y-2">
+                            {filteredTasks.map((task) => {
+                                const isOverdue = new Date(task.due_date) < new Date() && !task.completed;
+                                return (
+                                    <div
+                                        key={task.id}
+                                        className={`bg-slate-800 rounded-lg p-4 flex items-start gap-3 ${
+                                            isOverdue ? 'ring-2 ring-red-600' : ''
+                                        }`}
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            checked={task.completed || false}
+                                            onChange={() => handleToggleComplete(task)}
+                                            className="mt-1 w-5 h-5"
+                                        />
+                                        <div className="flex-1">
+                                            <p
+                                                className={`font-medium ${
+                                                    task.completed ? 'line-through text-slate-500' : 'text-white'
+                                                }`}
+                                            >
+                                                {task.title}
+                                            </p>
+                                            <div className="flex gap-2 mt-2">
+                                                <Badge color={getPriorityColor(task.priority)}>
+                                                    {task.priority || 'Medium'}
+                                                </Badge>
+                                                <span className="text-xs text-slate-300">
+                                                    {new Date(task.due_date).toLocaleDateString()}
+                                                </span>
+                                            </div>
+                                            {task.notes && (
+                                                <p className="text-sm text-slate-300 mt-2">{task.notes}</p>
+                                            )}
+                                        </div>
+                                        <div className="flex gap-2">
+                                            <button
+                                                onClick={() => {
+                                                    setEditingTask(task);
+                                                    setShowModal(true);
+                                                }}
+                                                className="text-blue-400 hover:text-blue-300 text-sm"
+                                            >
+                                                Edit
+                                            </button>
+                                            <button
+                                                onClick={() => handleDelete(task.id)}
+                                                className="text-red-400 hover:text-red-300 text-sm"
+                                            >
+                                                Delete
+                                            </button>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    <TaskModal
+                        isOpen={showModal}
+                        onClose={() => {
+                            setShowModal(false);
+                            setEditingTask(null);
+                        }}
+                        onSave={handleSave}
+                        initialData={editingTask}
+                    />
+                </div>
+            );
+        };
+
+        const TaskModal = ({ isOpen, onClose, onSave, initialData }) => {
+            const [title, setTitle] = React.useState('');
+            const [dueDate, setDueDate] = React.useState('');
+            const [priority, setPriority] = React.useState('medium');
+            const [notes, setNotes] = React.useState('');
+            const [contactId, setContactId] = React.useState('');
+            const [companyId, setCompanyId] = React.useState('');
+            const [dealId, setDealId] = React.useState('');
+            const [propertyId, setPropertyId] = React.useState('');
+            const [contacts, setContacts] = React.useState([]);
+            const [companies, setCompanies] = React.useState([]);
+
+            React.useEffect(() => {
+                if (initialData) {
+                    setTitle(initialData.title || '');
+                    setDueDate(initialData.due_date || '');
+                    setPriority(initialData.priority || 'medium');
+                    setNotes(initialData.notes || '');
+                    setContactId(initialData.contact_id || '');
+                    setCompanyId(initialData.company_id || '');
+                    setDealId(initialData.deal_id || '');
+                    setPropertyId(initialData.property_id || '');
+                } else {
+                    setTitle('');
+                    setDueDate('');
+                    setPriority('medium');
+                    setNotes('');
+                    setContactId('');
+                    setCompanyId('');
+                    setDealId('');
+                    setPropertyId('');
+                }
+            }, [initialData, isOpen]);
+
+            React.useEffect(() => {
+                fetchContacts();
+                fetchCompanies();
+            }, [isOpen]);
+
+            const fetchContacts = async () => {
+                const result = await api.request('GET', '/api/contacts');
+                if (!result.error) {
+                    setContacts(result.data || []);
+                }
+            };
+
+            const fetchCompanies = async () => {
+                const result = await api.request('GET', '/api/companies');
+                if (!result.error) {
+                    setCompanies(result.data || []);
+                }
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                onSave({
+                    title,
+                    due_date: dueDate,
+                    priority,
+                    notes,
+                    contact_id: contactId || null,
+                    company_id: companyId || null,
+                    deal_id: dealId || null,
+                    property_id: propertyId || null,
+                });
+            };
+
+            return (
+                <Modal
+                    isOpen={isOpen}
+                    onClose={onClose}
+                    title={initialData ? 'Edit Task' : 'New Task'}
+                    actions={
+                        <>
+                            <button
+                                onClick={onClose}
+                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleSubmit}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
+                            >
+                                Save
+                            </button>
+                        </>
+                    }
+                >
+                    <form className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Title</label>
+                            <input
+                                type="text"
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="Task title"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Contact</label>
+                            <select
+                                value={contactId}
+                                onChange={(e) => setContactId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">None</option>
+                                {contacts.map((contact) => (
+                                    <option key={contact.id} value={contact.id}>
+                                        {contact.name} {contact.company ? `(${contact.company})` : ''}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Company</label>
+                            <select
+                                value={companyId}
+                                onChange={(e) => setCompanyId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="">None</option>
+                                {companies.map((company) => (
+                                    <option key={company.id} value={company.id}>
+                                        {company.name}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Deal ID</label>
+                            <input
+                                type="text"
+                                value={dealId}
+                                onChange={(e) => setDealId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="Optional"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Property ID</label>
+                            <input
+                                type="text"
+                                value={propertyId}
+                                onChange={(e) => setPropertyId(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                placeholder="Optional"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Due Date</label>
+                            <input
+                                type="date"
+                                value={dueDate}
+                                onChange={(e) => setDueDate(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Priority</label>
+                            <select
+                                value={priority}
+                                onChange={(e) => setPriority(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            >
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Notes</label>
+                            <textarea
+                                value={notes}
+                                onChange={(e) => setNotes(e.target.value)}
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600 min-h-20"
+                                placeholder="Add any notes..."
+                            />
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // ============================================================================
+        // SETTINGS PAGE
+        // ============================================================================
+
+        const SettingsPage = ({ user }) => {
+            const [name, setName] = React.useState(user?.name || '');
+            const [email, setEmail] = React.useState(user?.email || '');
+            const [currentPassword, setCurrentPassword] = React.useState('');
+            const [newPassword, setNewPassword] = React.useState('');
+            const [confirmPassword, setConfirmPassword] = React.useState('');
+            const [apiKey, setApiKey] = React.useState('');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
+
+            const handleProfileUpdate = async (e) => {
+                e.preventDefault();
+                setLoading(true);
+                const result = await api.request('PUT', `/api/users/${user.id}`, { name, email });
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Profile updated', 'success');
+                }
+                setLoading(false);
+            };
+
+            const handlePasswordChange = async (e) => {
+                e.preventDefault();
+                if (newPassword !== confirmPassword) {
+                    show('Passwords do not match', 'error');
+                    return;
+                }
+                setLoading(true);
+                const result = await api.request('PUT', `/api/users/${user.id}/password`, {
+                    current_password: currentPassword,
+                    new_password: newPassword,
+                });
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('Password changed', 'success');
+                    setCurrentPassword('');
+                    setNewPassword('');
+                    setConfirmPassword('');
+                }
+                setLoading(false);
+            };
+
+            const handleApiKeyUpdate = async (e) => {
+                e.preventDefault();
+                setLoading(true);
+                const result = await api.request('PUT', `/api/users/${user.id}`, { api_key: apiKey });
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show('API key updated', 'success');
+                }
+                setLoading(false);
+            };
+
+            return (
+                <div className="space-y-6 max-w-2xl">
+                    {/* Profile Section */}
+                    <div className="bg-slate-800 rounded-lg p-6">
+                        <h2 className="text-xl font-bold mb-4">Profile</h2>
+                        <form onSubmit={handleProfileUpdate} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Name</label>
+                                <input
+                                    type="text"
+                                    value={name}
+                                    onChange={(e) => setName(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Email</label>
+                                <input
+                                    type="email"
+                                    value={email}
+                                    onChange={(e) => setEmail(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-50"
+                            >
+                                Save Profile
+                            </button>
+                        </form>
+                    </div>
+
+                    {/* Password Section */}
+                    <div className="bg-slate-800 rounded-lg p-6">
+                        <h2 className="text-xl font-bold mb-4">Change Password</h2>
+                        <form onSubmit={handlePasswordChange} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Current Password</label>
+                                <input
+                                    type="password"
+                                    value={currentPassword}
+                                    onChange={(e) => setCurrentPassword(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">New Password</label>
+                                <input
+                                    type="password"
+                                    value={newPassword}
+                                    onChange={(e) => setNewPassword(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Confirm Password</label>
+                                <input
+                                    type="password"
+                                    value={confirmPassword}
+                                    onChange={(e) => setConfirmPassword(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-50"
+                            >
+                                Change Password
+                            </button>
+                        </form>
+                    </div>
+
+                    {/* API Key Section */}
+                    <div className="bg-slate-800 rounded-lg p-6">
+                        <h2 className="text-xl font-bold mb-4">Claude API Key</h2>
+                        <p className="text-slate-300 text-sm mb-4">
+                            Add your Claude API key to enable AI Assistant features.
+                        </p>
+                        <form onSubmit={handleApiKeyUpdate} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium mb-1">API Key</label>
+                                <input
+                                    type="password"
+                                    value={apiKey}
+                                    onChange={(e) => setApiKey(e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    placeholder="sk-..."
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-50"
+                            >
+                                Update API Key
+                            </button>
+                        </form>
+                    </div>
+
+                    {/* Team Members Section */}
+                    <TeamMembersSection />
+                </div>
+            );
+        };
+
+        const TeamMembersSection = () => {
+            const [teamMembers, setTeamMembers] = React.useState([]);
+            const [showAddForm, setShowAddForm] = React.useState(false);
+            const [newName, setNewName] = React.useState('');
+            const [newEmail, setNewEmail] = React.useState('');
+            const [newPassword, setNewPassword] = React.useState('');
+            const [newRole, setNewRole] = React.useState('broker');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
+
+            const fetchTeam = async () => {
+                const result = await api.request('GET', '/api/users');
+                if (!result.error) setTeamMembers(result.data || result || []);
+            };
+
+            React.useEffect(() => { fetchTeam(); }, []);
+
+            const handleAddUser = async (e) => {
+                e.preventDefault();
+                if (!newName || !newEmail || !newPassword) {
+                    show('All fields required', 'error');
+                    return;
+                }
+                setLoading(true);
+                const result = await api.request('POST', '/api/users', {
+                    name: newName,
+                    email: newEmail,
+                    password: newPassword,
+                    role: newRole,
+                });
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(`${newName} added to team`, 'success');
+                    setNewName(''); setNewEmail(''); setNewPassword(''); setNewRole('broker');
+                    setShowAddForm(false);
+                    fetchTeam();
+                }
+                setLoading(false);
+            };
+
+            return (
+                <div className="bg-slate-800 rounded-lg p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-xl font-bold">Team Members</h2>
+                        <button
+                            onClick={() => setShowAddForm(!showAddForm)}
+                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm"
+                        >
+                            + Add User
+                        </button>
+                    </div>
+
+                    {showAddForm && (
+                        <form onSubmit={handleAddUser} className="bg-slate-700 rounded-lg p-4 mb-4 space-y-3">
+                            <h3 className="font-medium text-sm text-slate-300">New Team Member</h3>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="block text-xs text-slate-300 mb-1">Name</label>
+                                    <input
+                                        type="text"
+                                        value={newName}
+                                        onChange={(e) => setNewName(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="Full name"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-300 mb-1">Email</label>
+                                    <input
+                                        type="email"
+                                        value={newEmail}
+                                        onChange={(e) => setNewEmail(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="email@example.com"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-300 mb-1">Password</label>
+                                    <input
+                                        type="password"
+                                        value={newPassword}
+                                        onChange={(e) => setNewPassword(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="Min 6 characters"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-300 mb-1">Role</label>
+                                    <select
+                                        value={newRole}
+                                        onChange={(e) => setNewRole(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    >
+                                        <option value="broker">Broker</option>
+                                        <option value="admin">Admin</option>
+                                        <option value="assistant">Assistant</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div className="flex gap-2 pt-1">
+                                <button
+                                    type="submit"
+                                    disabled={loading}
+                                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm disabled:opacity-50"
+                                >
+                                    {loading ? 'Adding...' : 'Add Team Member'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowAddForm(false)}
+                                    className="px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white rounded text-sm"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    )}
+
+                    <div className="divide-y divide-slate-700">
+                        {teamMembers.length === 0 ? (
+                            <p className="text-slate-300 text-sm py-2">No team members yet.</p>
+                        ) : (
+                            teamMembers.map((member) => (
+                                <div key={member.id} className="py-3 flex items-center justify-between">
+                                    <div>
+                                        <p className="font-medium text-sm">{member.name}</p>
+                                        <p className="text-xs text-slate-300">{member.email}</p>
+                                    </div>
+                                    <span className="text-xs bg-slate-700 px-2 py-1 rounded capitalize">{member.role}</span>
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================================
+        // ACTIVITY LOG PAGE
+        // ============================================================================
+
+        const ActivityLogPage = () => {
+            const [activity, setActivity] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+
+            React.useEffect(() => {
+                const fetchActivity = async () => {
+                    setLoading(true);
+                    const result = await api.request('GET', '/api/activity');
+                    if (!result.error) {
+                        setActivity(result.data || []);
+                    }
+                    setLoading(false);
+                };
+
+                fetchActivity();
+            }, []);
+
+            if (loading) return <Spinner />;
+
+            return (
+                <div className="space-y-4">
+                    <h1 className="text-2xl font-bold">Activity Log</h1>
+
+                    {activity.length === 0 ? (
+                        <EmptyState
+                            icon="📋"
+                            title="No activity yet"
+                            message="Activity will appear here as you work in the CRM."
+                        />
+                    ) : (
+                        <div className="bg-slate-800 rounded-lg divide-y divide-slate-700">
+                            {activity.map((item) => (
+                                <div key={item.id} className="p-4 hover:bg-slate-700/30">
+                                    <div className="flex items-start gap-3">
+                                        <span className="text-2xl">{getActivityIcon(item.action)}</span>
+                                        <div className="flex-1">
+                                            <p className="text-white">{item.description}</p>
+                                            <p className="text-xs text-slate-500 mt-1">
+                                                {item.user_name} · {formatDate(item.created_at)}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================================
+        // AI ASSISTANT PAGE
+        // ============================================================================
+
+        const AiAssistantPage = ({ user }) => {
+            const [messages, setMessages] = React.useState([]);
+            const [input, setInput] = React.useState('');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
+
+            const hasApiKey = user?.api_key;
+
+            const handleSendMessage = async () => {
+                if (!input.trim()) return;
+
+                const userMessage = input;
+                setInput('');
+                setMessages([...messages, { role: 'user', content: userMessage }]);
+                setLoading(true);
+
+                const result = await api.request('POST', '/api/ai/chat', {
+                    messages: [...messages, { role: 'user', content: userMessage }],
+                });
+
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    setMessages([
+                        ...messages,
+                        { role: 'user', content: userMessage },
+                        { role: 'assistant', content: result.data.content },
+                    ]);
+                }
+                setLoading(false);
+            };
+
+            const quickActions = [
+                'Draft Email',
+                'Summarize My Pipeline',
+                'Generate Call List',
+                'Market Analysis',
+            ];
+
+            if (!hasApiKey) {
+                return (
+                    <EmptyState
+                        icon="🤖"
+                        title="AI Assistant Not Set Up"
+                        message="Add your Claude API key in Settings to enable AI Assistant features."
+                        action={
+                            <button className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white">
+                                Go to Settings
+                            </button>
+                        }
+                    />
+                );
+            }
+
+            return (
+                <div className="h-full flex flex-col max-w-4xl">
+                    <h1 className="text-2xl font-bold mb-4">AI Assistant</h1>
+
+                    {/* Quick Actions */}
+                    <div className="flex gap-2 mb-4 flex-wrap">
+                        {quickActions.map((action) => (
+                            <button
+                                key={action}
+                                onClick={() => setInput(action)}
+                                className="text-xs px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                            >
+                                {action}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Messages */}
+                    <div className="flex-1 bg-slate-800 rounded-lg p-4 mb-4 overflow-y-auto space-y-4">
+                        {messages.length === 0 ? (
+                            <p className="text-slate-300 text-center mt-8">
+                                Start a conversation with your AI assistant
+                            </p>
+                        ) : (
+                            messages.map((msg, idx) => (
+                                <div
+                                    key={idx}
+                                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                                >
+                                    <div
+                                        className={`max-w-md px-4 py-2 rounded-lg ${
+                                            msg.role === 'user'
+                                                ? 'bg-blue-600 text-white'
+                                                : 'bg-slate-700 text-slate-200'
+                                        }`}
+                                    >
+                                        {msg.content}
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                        {loading && <Spinner />}
+                    </div>
+
+                    {/* Input */}
+                    <div className="flex gap-2">
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={(e) => setInput(e.target.value)}
+                            onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                            className="flex-1 bg-slate-800 rounded px-4 py-2 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            placeholder="Ask me anything..."
+                            disabled={loading}
+                        />
+                        <button
+                            onClick={handleSendMessage}
+                            disabled={loading || !input.trim()}
+                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white disabled:opacity-50"
+                        >
+                            Send
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================================
+        // COMPANIES PAGE
+        // ============================================================================
+
+        const CompaniesPage = () => {
+            const [companies, setCompanies] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const [search, setSearch] = React.useState('');
+            const [showModal, setShowModal] = React.useState(false);
+            const [editing, setEditing] = React.useState(null);
+            const { show } = useToast();
+
+            const fetchCompanies = async () => {
+                const result = await api.request('GET', '/api/companies');
+                if (!result.error) setCompanies(result.data || []);
+                setLoading(false);
+            };
+
+            React.useEffect(() => { fetchCompanies(); }, []);
+
+            const handleSave = async (formData) => {
+                const method = editing ? 'PUT' : 'POST';
+                const url = editing ? `/api/companies/${editing.id}` : '/api/companies';
+                const result = await api.request(method, url, formData);
+                if (!result.error && !result.data?.error) {
+                    show(editing ? 'Company updated' : 'Company created', 'success');
+                    setShowModal(false);
+                    setEditing(null);
+                    fetchCompanies();
+                } else {
+                    show(result.data?.error || 'Failed to save', 'error');
+                }
+            };
+
+            const handleDelete = async (id) => {
+                if (!confirm('Delete this company? Contacts linked to it will be unlinked.')) return;
+                const result = await api.request('DELETE', `/api/companies/${id}`);
+                if (!result.error) {
+                    show('Company deleted', 'success');
+                    fetchCompanies();
+                }
+            };
+
+            const filtered = companies.filter(c =>
+                !search || (c.name || '').toLowerCase().includes(search.toLowerCase()) ||
+                (c.industry || '').toLowerCase().includes(search.toLowerCase()) ||
+                (c.city || '').toLowerCase().includes(search.toLowerCase())
+            );
+
+            if (loading) return <div className="text-slate-400">Loading companies...</div>;
+
+            return (
+                <div>
+                    <div className="flex justify-between items-center mb-6">
+                        <div>
+                            <h1 className="text-2xl font-bold">Companies</h1>
+                            <p className="text-slate-400 text-sm">{companies.length} total</p>
+                        </div>
+                        <div className="flex gap-3">
+                            <input type="text" placeholder="Search companies..." value={search}
+                                onChange={(e) => setSearch(e.target.value)}
+                                className="bg-slate-800 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-600 w-64" />
+                            <button onClick={() => { setEditing(null); setShowModal(true); }}
+                                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm font-medium transition">
+                                + New Company
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="bg-slate-800 rounded-lg overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="text-left text-slate-400 border-b border-slate-700">
+                                    <th className="px-4 py-3 font-medium">Name</th>
+                                    <th className="px-4 py-3 font-medium">Industry</th>
+                                    <th className="px-4 py-3 font-medium">City</th>
+                                    <th className="px-4 py-3 font-medium">State</th>
+                                    <th className="px-4 py-3 font-medium">Contacts</th>
+                                    <th className="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {filtered.length === 0 ? (
+                                    <tr><td colSpan="6" className="px-4 py-8 text-center text-slate-500">No companies found</td></tr>
+                                ) : filtered.map(c => (
+                                    <tr key={c.id} className="hover:bg-slate-700/50">
+                                        <td className="px-4 py-3 font-medium">{c.name}</td>
+                                        <td className="px-4 py-3 text-slate-300">{c.industry || '—'}</td>
+                                        <td className="px-4 py-3 text-slate-300">{c.city || '—'}</td>
+                                        <td className="px-4 py-3 text-slate-300">{c.state || '—'}</td>
+                                        <td className="px-4 py-3 text-slate-300">{c.contact_count || 0}</td>
+                                        <td className="px-4 py-3">
+                                            <button onClick={() => { setEditing(c); setShowModal(true); }}
+                                                className="text-blue-400 hover:text-blue-300 text-sm mr-3">Edit</button>
+                                            <button onClick={() => handleDelete(c.id)}
+                                                className="text-red-400 hover:text-red-300 text-sm">Delete</button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    {showModal && (
+                        <CompanyModal
+                            isOpen={showModal}
+                            onClose={() => { setShowModal(false); setEditing(null); }}
+                            onSave={handleSave}
+                            initialData={editing}
+                        />
+                    )}
+                </div>
+            );
+        };
+
+        const CompanyModal = ({ isOpen, onClose, onSave, initialData }) => {
+            const [form, setForm] = React.useState({
+                name: '', type: '', industry: '', website: '', phone: '',
+                address: '', city: '', state: 'WA', submarket: '', notes: ''
+            });
+
+            React.useEffect(() => {
+                if (initialData) {
+                    setForm({
+                        name: initialData.name || '',
+                        type: initialData.type || '',
+                        industry: initialData.industry || '',
+                        website: initialData.website || '',
+                        phone: initialData.phone || '',
+                        address: initialData.address || '',
+                        city: initialData.city || '',
+                        state: initialData.state || 'WA',
+                        submarket: initialData.submarket || '',
+                        notes: initialData.notes || '',
+                    });
+                }
+            }, [initialData, isOpen]);
+
+            const handleSubmit = (e) => { e.preventDefault(); onSave(form); };
+            const update = (key, val) => setForm(prev => ({ ...prev, [key]: val }));
+
+            const submarkets = ['Bellevue', 'Kirkland', 'Redmond', 'Bothell', 'Woodinville', 'Issaquah', 'Snoqualmie', 'Everett', 'Renton', 'Kent', 'Auburn', 'Seattle', 'Other'];
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} title={initialData ? 'Edit Company' : 'New Company'}
+                    actions={<>
+                        <button onClick={onClose} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded">Cancel</button>
+                        <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white">Save</button>
+                    </>}>
+                    <form className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="col-span-2">
+                                <label className="block text-sm font-medium mb-1">Company Name *</label>
+                                <input type="text" value={form.name} onChange={(e) => update('name', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" placeholder="Company name" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Industry</label>
+                                <input type="text" value={form.industry} onChange={(e) => update('industry', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Phone</label>
+                                <input type="text" value={form.phone} onChange={(e) => update('phone', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div className="col-span-2">
+                                <label className="block text-sm font-medium mb-1">Address</label>
+                                <input type="text" value={form.address} onChange={(e) => update('address', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">City</label>
+                                <input type="text" value={form.city} onChange={(e) => update('city', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">State</label>
+                                <input type="text" value={form.state} onChange={(e) => update('state', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Submarket</label>
+                                <select value={form.submarket} onChange={(e) => update('submarket', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600">
+                                    <option value="">Select...</option>
+                                    {submarkets.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Website</label>
+                                <input type="text" value={form.website} onChange={(e) => update('website', e.target.value)}
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                            <div className="col-span-2">
+                                <label className="block text-sm font-medium mb-1">Notes</label>
+                                <textarea value={form.notes} onChange={(e) => update('notes', e.target.value)} rows="3"
+                                    className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            </div>
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // ============================================================================
+        // LISTINGS PAGE
+        // ============================================================================
+
+        const ListingsPage = () => {
+            const [listings, setListings] = React.useState([]);
+            const [loading, setLoading] = React.useState(true);
+            const { show } = useToast();
+
+            React.useEffect(() => {
+                const fetch = async () => {
+                    const result = await api.request('GET', '/api/properties/listings');
+                    if (!result.error) setListings(result.data || []);
+                    setLoading(false);
+                };
+                fetch();
+            }, []);
+
+            if (loading) return <div className="text-slate-400">Loading listings...</div>;
+
+            return (
+                <div>
+                    <div className="flex justify-between items-center mb-6">
+                        <div>
+                            <h1 className="text-2xl font-bold">Active Listings</h1>
+                            <p className="text-slate-400 text-sm">{listings.length} active</p>
+                        </div>
+                    </div>
+
+                    {listings.length === 0 ? (
+                        <div className="bg-slate-800 rounded-lg p-12 text-center">
+                            <div className="text-4xl mb-3">🏪</div>
+                            <p className="text-slate-400">No active listings yet.</p>
+                            <p className="text-slate-500 text-sm mt-1">Mark a property as a listing in the Properties page to see it here.</p>
+                        </div>
+                    ) : (
+                        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                            {listings.map(p => (
+                                <div key={p.id} className="bg-slate-800 rounded-lg p-5 border border-slate-700 hover:border-slate-600 transition">
+                                    <h3 className="font-semibold mb-1">{p.name || p.address}</h3>
+                                    <p className="text-sm text-slate-400">{[p.city, p.state].filter(Boolean).join(', ')}</p>
+                                    {p.submarket && <p className="text-xs text-blue-400 mt-1">{p.submarket}</p>}
+                                    <div className="flex gap-4 mt-3 text-xs text-slate-300">
+                                        {p.size_sf && <span>{Number(p.size_sf).toLocaleString()} SF</span>}
+                                        {p.type && <span className="capitalize">{p.type}</span>}
+                                        {p.asking_rate && <span>{p.asking_rate} {p.rate_type || ''}</span>}
+                                    </div>
+                                    <div className="flex gap-3 mt-3 text-xs">
+                                        <span className="bg-green-900/40 text-green-300 px-2 py-0.5 rounded capitalize">{p.status || 'available'}</span>
+                                        {p.inquiry_count > 0 && <span className="bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded">{p.inquiry_count} inquiries</span>}
+                                    </div>
+                                    {p.listing_broker_name && <p className="text-xs text-slate-500 mt-2">Broker: {p.listing_broker_name}</p>}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================================
+        // IMPORT PAGE
+        // ============================================================================
+
+        // Detect CSV type from its headers
+        const detectCsvType = (csvText) => {
+            const firstLine = csvText.split('\n')[0].toLowerCase();
+            // Check most specific patterns first to avoid misidentification
+            // Contacts CSV contains "company name" and "address line" too, so must check BEFORE companies
+            if (firstLine.includes('first name') && firstLine.includes('last name')) return 'contacts';
+            if (firstLine.includes('activity type') || firstLine.includes('activity id')) return 'activities';
+            if (firstLine.includes('deal name')) return 'deals';
+            // Properties has "property name" but NOT "company id" (contacts has both)
+            if (firstLine.includes('property name') && !firstLine.includes('company id')) return 'properties';
+            // Companies is the most generic — check last
+            if (firstLine.includes('company name')) return 'companies';
+            return null;
+        };
+
+        const TYPE_META = {
+            companies:  { label: 'Companies',        endpoint: '/api/import/companies',  icon: '🏢' },
+            properties: { label: 'Properties',       endpoint: '/api/import/properties', icon: '🏗️' },
+            contacts:   { label: 'Contacts',         endpoint: '/api/import/contacts',   icon: '👥' },
+            activities: { label: 'Activities',       endpoint: '/api/import/activities', icon: '📋' },
+            deals:      { label: 'Deals',            endpoint: '/api/import/deals',      icon: '📈' },
+        };
+
+        const ImportPage = () => {
+            const [files, setFiles] = React.useState([]); // [{name, type, csv, status, result}]
+            const [importing, setImporting] = React.useState(false);
+            const [clearing, setClearing] = React.useState(false);
+            const { show } = useToast();
+
+            const clearEntity = async (entity, label) => {
+                if (!confirm(`Are you sure you want to delete ALL ${label} data? This cannot be undone.`)) return;
+                setClearing(true);
+                const result = await api.request('DELETE', `/api/import/clear/${entity}`);
+                if (result.data?.success) {
+                    show(`${label} data cleared (${result.data.deleted} records)`, 'success');
+                } else {
+                    show(result.data?.error || 'Failed to clear', 'error');
+                }
+                setClearing(false);
+            };
+
+            const readFile = (file) => new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = reject;
+                reader.readAsText(file);
+            });
+
+            const handleFilesSelected = async (e) => {
+                const selected = Array.from(e.target.files || []);
+                if (!selected.length) return;
+                const parsed = await Promise.all(selected.map(async (file) => {
+                    const csv = await readFile(file);
+                    const type = detectCsvType(csv);
+                    return { name: file.name, type, csv, status: type ? 'ready' : 'unknown', result: null };
+                }));
+                setFiles(parsed);
+            };
+
+            const runImport = async () => {
+                const order = ['companies', 'properties', 'contacts', 'activities', 'deals'];
+                const ready = files.filter(f => f.type && f.status === 'ready');
+                if (!ready.length) { show('No recognizable CSV files selected', 'error'); return; }
+
+                setImporting(true);
+                // Sort by import order
+                const sorted = [...ready].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
+
+                for (const f of sorted) {
+                    setFiles(prev => prev.map(x => x.name === f.name ? { ...x, status: 'importing' } : x));
+                    const meta = TYPE_META[f.type];
+                    const result = await api.request('POST', meta.endpoint, { csv: f.csv });
+                    const data = result.data || {};
+                    setFiles(prev => prev.map(x => x.name === f.name ? {
+                        ...x,
+                        status: data.error ? 'error' : 'done',
+                        result: data.error ? { error: data.error } : { imported: data.imported || 0, skipped: data.skipped || 0 }
+                    } : x));
+                }
+                setImporting(false);
+                show('Import complete!', 'success');
+            };
+
+            const hasReady = files.some(f => f.type && f.status === 'ready');
+
+            return (
+                <div className="space-y-6 max-w-2xl">
+                    <div>
+                        <h1 className="text-2xl font-bold mb-2">Import Data</h1>
+                        <p className="text-slate-300 text-sm">Drop all your CRE OneSource CSV files at once — the importer will auto-detect each type and run them in the correct order.</p>
+                    </div>
+
+                
