@@ -22,8 +22,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'km-crm-dev-secret-CHANGE-IN-PRODUCTION';
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+// Increase timeout for large imports
+app.use('/api/import', (req, res, next) => { req.setTimeout(300000); res.setTimeout(300000); next(); });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DATABASE SETUP
@@ -1183,185 +1185,227 @@ app.delete('/api/import/clear/:entity', authenticate, async (req, res) => {
   }
 });
 
-// Import Companies
+// Import Companies (batch)
 app.post('/api/import/companies', authenticate, async (req, res) => {
   try {
     const { csv } = req.body;
     if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
     const rows = parseCSV(csv);
-    let imported = 0, skipped = 0, errors = [];
+    let imported = 0, skipped = 0;
 
+    // Get existing company names for fast dedup
+    const existingRes = await pool.query('SELECT LOWER(name) as n FROM companies');
+    const existingNames = new Set(existingRes.rows.map(r => r.n));
+
+    // Build batch
+    const toInsert = [];
     for (const row of rows) {
       const name = (row['Company Name'] || '').trim();
       if (!name) { skipped++; continue; }
-      const existing = await pool.query('SELECT id FROM companies WHERE name = $1', [name]);
-      if (existing.rows.length > 0) { skipped++; continue; }
-      try {
-        await pool.query('INSERT INTO companies (name, address, city, state, created_by) VALUES ($1,$2,$3,$4,$5)',
-          [name, row['Address Line 1'] || '', row['City'] || '', row['State'] || 'WA', req.user.id]);
-        imported++;
-      } catch (e) { errors.push(name); }
+      if (existingNames.has(name.toLowerCase())) { skipped++; continue; }
+      existingNames.add(name.toLowerCase());
+      toInsert.push([name, row['Address Line 1'] || '', row['City'] || '', row['State'] || 'WA', req.user.id]);
+    }
+
+    // Insert in batches of 200
+    for (let i = 0; i < toInsert.length; i += 200) {
+      const batch = toInsert.slice(i, i + 200);
+      const placeholders = batch.map((_, idx) => {
+        const base = idx * 5;
+        return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5})`;
+      }).join(',');
+      const values = batch.flat();
+      await pool.query(`INSERT INTO companies (name, address, city, state, created_by) VALUES ${placeholders}`, values);
+      imported += batch.length;
     }
 
     await logActivity('import', 'company', null, `${imported} companies imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: errors.length, total: rows.length });
+    res.json({ imported, skipped, errors: 0, total: rows.length });
   } catch (err) {
     console.error('Error importing companies:', err);
-    res.status(500).json({ error: 'Import failed' });
+    res.status(500).json({ error: 'Import failed: ' + err.message });
   }
 });
 
-// Import Contacts
+// Import Contacts (batch)
 app.post('/api/import/contacts', authenticate, async (req, res) => {
   try {
     const { csv } = req.body;
     if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
     const rows = parseCSV(csv);
-    let imported = 0, skipped = 0, errors = [];
+    let imported = 0, skipped = 0;
 
+    // Preload company name→id map
+    const coRes = await pool.query('SELECT id, LOWER(name) as n FROM companies');
+    const companyMap = {};
+    coRes.rows.forEach(r => { companyMap[r.n] = r.id; });
+
+    // Build batch (17 fields per contact)
+    const COLS = 17;
+    const toInsert = [];
     for (const row of rows) {
       const firstName = (row['First Name'] || '').trim();
       if (!firstName) { skipped++; continue; }
 
-      const existing = await pool.query(
-        'SELECT id FROM contacts WHERE first_name = $1 AND last_name = $2 AND (phone = $3 OR email = $4)',
-        [firstName, row['Last Name'] || '', row['Phone'] || '', row['Email Address'] || '']
-      );
-      if (existing.rows.length > 0) { skipped++; continue; }
-
-      // Find or create company
-      let companyId = null;
       const companyName = (row['Company Name'] || '').trim();
-      if (companyName) {
-        const co = await pool.query('SELECT id FROM companies WHERE name = $1', [companyName]);
-        if (co.rows.length > 0) {
-          companyId = co.rows[0].id;
-        } else {
-          const result = await pool.query('INSERT INTO companies (name, created_by) VALUES ($1,$2) RETURNING id', [companyName, req.user.id]);
-          companyId = result.rows[0].id;
-        }
+      let companyId = companyName ? (companyMap[companyName.toLowerCase()] || null) : null;
+      // Auto-create company if missing
+      if (companyName && !companyId) {
+        const r = await pool.query('INSERT INTO companies (name, created_by) VALUES ($1,$2) RETURNING id', [companyName, req.user.id]);
+        companyId = r.rows[0].id;
+        companyMap[companyName.toLowerCase()] = companyId;
       }
 
-      // Build tags from Contact Type
-      const tags = (row['Contact Type'] || '').trim();
+      // Extract address from Notes field (e.g. "Mailing Address: 123 Main St, City, WA 98001")
+      const notes = row['Notes'] || '';
+      let buildingAddress = '';
+      let cleanNotes = notes;
+      const addrMatch = notes.match(/Mailing Address:\s*(.+)/i);
+      if (addrMatch) {
+        buildingAddress = addrMatch[1].trim();
+        cleanNotes = notes.replace(/Mailing Address:\s*.+/i, '').trim();
+      }
 
-      try {
-        await pool.query(`INSERT INTO contacts
-          (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-          [
-            firstName,
-            row['Last Name'] || '',
-            companyId,
-            row['Email Address'] || '',
-            row['Phone'] || row['Direct Phone'] || '',
-            row['Mobile Phone'] || row['Cell Phone'] || '',
-            tags,
-            row['Prospect Type'] || '',
-            row['Group(s)'] || row['Group'] || row['Dot'] || row['Group/Dot'] || '',
-            row['Asset Type'] || row['Property Type'] || '',
-            row['Submarket'] || '',
-            row['Estimated Size'] ? `${row['Estimated Size']} ${row['Size Type'] || 'SF'}`.trim() : '',
-            row['Industry'] || '',
-            row['Property Name'] || row['Building Name'] || '',
-            row['Building Address'] || '',
-            row['Notes'] || '',
-            req.user.id
-          ]);
-        imported++;
-      } catch (e) { errors.push(`${firstName} ${row['Last Name'] || ''}`); }
+      toInsert.push([
+        firstName,
+        row['Last Name'] || '',
+        companyId,
+        row['Email Address'] || '',
+        row['Phone'] || '',
+        row['Mobile Phone'] || '',
+        (row['Contact Type'] || '').trim(),
+        row['Prospect Type'] || '',
+        row['Group(s)'] || '',
+        row['Asset Type'] || '',
+        row['Submarket'] || '',
+        row['Estimated Size'] ? `${row['Estimated Size']} ${row['Size Type'] || 'SF'}`.trim() : '',
+        row['Industry'] || '',
+        row['Property Name'] || '',
+        buildingAddress,
+        cleanNotes,
+        req.user.id
+      ]);
+    }
+
+    // Insert in batches of 100
+    for (let i = 0; i < toInsert.length; i += 100) {
+      const batch = toInsert.slice(i, i + 100);
+      const placeholders = batch.map((_, idx) => {
+        const b = idx * COLS;
+        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
+      }).join(',');
+      const values = batch.flat();
+      await pool.query(`INSERT INTO contacts
+        (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by)
+        VALUES ${placeholders}`, values);
+      imported += batch.length;
     }
 
     await logActivity('import', 'contact', null, `${imported} contacts imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: errors.length, total: rows.length });
+    res.json({ imported, skipped, errors: 0, total: rows.length });
   } catch (err) {
     console.error('Error importing contacts:', err);
-    res.status(500).json({ error: 'Import failed' });
+    res.status(500).json({ error: 'Import failed: ' + err.message });
   }
 });
 
-// Import Activities as Tasks
+// Import Activities as Tasks (batch)
 app.post('/api/import/activities', authenticate, async (req, res) => {
   try {
     const { csv } = req.body;
     if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
     const rows = parseCSV(csv);
-    let imported = 0, skipped = 0, errors = [];
+    let imported = 0, skipped = 0;
 
+    // Preload contact name→id map
+    const cRes = await pool.query('SELECT id, LOWER(first_name || \' \' || COALESCE(last_name, \'\')) as n FROM contacts');
+    const contactMap = {};
+    cRes.rows.forEach(r => { contactMap[r.n.trim()] = r.id; });
+
+    const COLS = 7;
+    const toInsert = [];
     for (const row of rows) {
       const subject = (row['Subject'] || row['Activity Type'] || '').trim();
       if (!subject) { skipped++; continue; }
 
-      // Find linked contact
-      let contactId = null;
-      const contactName = (row['Contact Name'] || '').trim();
-      if (contactName) {
-        const parts = contactName.split(' ');
-        const c = await pool.query('SELECT id FROM contacts WHERE first_name = $1 AND last_name = $2',
-          [parts[0] || '', parts.slice(1).join(' ') || '']);
-        if (c.rows.length > 0) contactId = c.rows[0].id;
-      }
-
+      const contactName = (row['Contact Name'] || '').trim().toLowerCase();
+      const contactId = contactMap[contactName] || null;
       const isComplete = row['Is Complete'] === 'Yes' || row['Is Complete'] === '1';
       const priority = row['Activity Type'] === 'Task' ? 'high' : 'medium';
       const dueDate = row['Date'] || row['Completed Date'] || null;
 
-      try {
-        await pool.query(`INSERT INTO tasks (title, due_date, completed, priority, contact_id, notes, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [subject, dueDate, isComplete, priority, contactId, row['Notes'] || '', req.user.id]);
-        imported++;
-      } catch (e) { errors.push(subject); }
+      toInsert.push([subject, dueDate, isComplete, priority, contactId, row['Notes'] || '', req.user.id]);
+    }
+
+    for (let i = 0; i < toInsert.length; i += 200) {
+      const batch = toInsert.slice(i, i + 200);
+      const placeholders = batch.map((_, idx) => {
+        const b = idx * COLS;
+        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
+      }).join(',');
+      await pool.query(`INSERT INTO tasks (title, due_date, completed, priority, contact_id, notes, created_by) VALUES ${placeholders}`, batch.flat());
+      imported += batch.length;
     }
 
     await logActivity('import', 'task', null, `${imported} activities imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: errors.length, total: rows.length });
+    res.json({ imported, skipped, errors: 0, total: rows.length });
   } catch (err) {
     console.error('Error importing activities:', err);
-    res.status(500).json({ error: 'Import failed' });
+    res.status(500).json({ error: 'Import failed: ' + err.message });
   }
 });
 
-// Import Properties
+// Import Properties (batch)
 app.post('/api/import/properties', authenticate, async (req, res) => {
   try {
     const { csv } = req.body;
     if (!csv) return res.status(400).json({ error: 'No CSV data provided' });
     const rows = parseCSV(csv);
-    let imported = 0, skipped = 0, errors = [];
+    let imported = 0, skipped = 0;
 
+    // Get existing property names for dedup
+    const existingRes = await pool.query('SELECT LOWER(name) as n FROM properties WHERE name IS NOT NULL');
+    const existingNames = new Set(existingRes.rows.map(r => r.n));
+
+    const COLS = 9;
+    const toInsert = [];
     for (const row of rows) {
       const propName = (row['Property Name'] || '').trim();
+      if (!propName) { skipped++; continue; }
+      if (existingNames.has(propName.toLowerCase())) { skipped++; continue; }
+      existingNames.add(propName.toLowerCase());
+
       const address = (row['Address Line 1'] || propName).trim();
-      if (!propName && !address) { skipped++; continue; }
-      const existing = await pool.query(
-        'SELECT id FROM properties WHERE (name = $1 AND $1 != \'\') OR (address = $2 AND $2 != \'\')',
-        [propName, address]);
-      if (existing.rows.length > 0) { skipped++; continue; }
-      try {
-        const sizeSf = parseInt((row['Size'] || row['Lot Size'] || '').replace(/[,\s]/g, '')) || null;
-        await pool.query(`INSERT INTO properties (name, address, city, state, submarket, type, size_sf, notes, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-          [
-            propName,
-            address,
-            row['City'] || '',
-            row['State'] || 'WA',
-            row['Submarket'] || '',
-            (row['Asset Type'] || row['Classification'] || '').toLowerCase() || null,
-            sizeSf,
-            row['Notes'] || '',
-            req.user.id
-          ]);
-        imported++;
-      } catch (e) { errors.push(address); }
+      const sizeSf = parseInt((row['Size'] || row['Lot Size'] || '').replace(/[,\s]/g, '')) || null;
+
+      toInsert.push([
+        propName,
+        address,
+        row['City'] || '',
+        row['State'] || 'WA',
+        row['Submarket'] || '',
+        (row['Asset Type'] || row['Classification'] || '').toLowerCase() || null,
+        sizeSf,
+        row['Notes'] || '',
+        req.user.id
+      ]);
+    }
+
+    for (let i = 0; i < toInsert.length; i += 200) {
+      const batch = toInsert.slice(i, i + 200);
+      const placeholders = batch.map((_, idx) => {
+        const b = idx * COLS;
+        return `(${Array.from({length: COLS}, (_, j) => '$' + (b + j + 1)).join(',')})`;
+      }).join(',');
+      await pool.query(`INSERT INTO properties (name, address, city, state, submarket, type, size_sf, notes, created_by) VALUES ${placeholders}`, batch.flat());
+      imported += batch.length;
     }
 
     await logActivity('import', 'property', null, `${imported} properties imported`, null, req.user.id);
-    res.json({ imported, skipped, errors: errors.length, total: rows.length });
+    res.json({ imported, skipped, errors: 0, total: rows.length });
   } catch (err) {
     console.error('Error importing properties:', err);
-    res.status(500).json({ error: 'Import failed' });
+    res.status(500).json({ error: 'Import failed: ' + err.message });
   }
 });
 
@@ -1465,4 +1509,4 @@ app.get('*', (req, res) => {
     console.error('Failed to start server:', err);
     process.exit(1);
   }
-})()
+})();
