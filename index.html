@@ -92,7 +92,8 @@
                 }
 
                 try {
-                    const response = await fetch(`/api${path}`, options);
+                    const url = path.startsWith('/api/') ? path : `/api${path}`;
+                    const response = await fetch(url, options);
                     if (response.status === 401) {
                         localStorage.removeItem('token');
                         window.location.reload();
@@ -721,31 +722,24 @@
                                         >
                                             Company {sortColumn === 'company' && (sortOrder === 'asc' ? '↑' : '↓')}
                                         </th>
-                                        <th className="px-4 py-3 text-left font-semibold">Email</th>
-                                        <th className="px-4 py-3 text-left font-semibold">Phone</th>
-                                        <th className="px-4 py-3 text-left font-semibold">Tags</th>
+                                                        <th className="px-4 py-3 text-left font-semibold">Email</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Direct</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Mobile</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Prospect Type</th>
+                                        <th className="px-4 py-3 text-left font-semibold">Submarket</th>
                                         <th className="px-4 py-3 text-left font-semibold">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {filteredContacts.map((contact) => (
                                         <tr key={contact.id} className="border-t border-slate-700 hover:bg-slate-700/50">
-                                            <td className="px-4 py-3">{contact.name}</td>
+                                            <td className="px-4 py-3 font-medium">{contact.first_name} {contact.last_name || ''}</td>
                                             <td className="px-4 py-3 text-slate-300">{contact.company || '-'}</td>
                                             <td className="px-4 py-3 text-slate-400 text-sm">{contact.email || '-'}</td>
                                             <td className="px-4 py-3 text-slate-400 text-sm">{contact.phone || '-'}</td>
-                                            <td className="px-4 py-3">
-                                                <div className="flex flex-wrap gap-1">
-                                                    {(contact.tags || '')
-                                                        .split(',')
-                                                        .filter((t) => t.trim())
-                                                        .map((tag, idx) => (
-                                                            <Badge key={idx} color="blue">
-                                                                {tag.trim()}
-                                                            </Badge>
-                                                        ))}
-                                                </div>
-                                            </td>
+                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.mobile_phone || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.prospect_type || '-'}</td>
+                                            <td className="px-4 py-3 text-slate-400 text-sm">{contact.submarket || '-'}</td>
                                             <td className="px-4 py-3 text-sm">
                                                 <button
                                                     onClick={() => {
@@ -778,133 +772,158 @@
                         }}
                         onSave={handleSave}
                         initialData={editingContact}
-                        availableTags={availableTags}
                     />
                 </div>
             );
         };
 
-        const ContactModal = ({ isOpen, onClose, onSave, initialData, availableTags }) => {
-            const [name, setName] = React.useState('');
-            const [email, setEmail] = React.useState('');
-            const [phone, setPhone] = React.useState('');
-            const [company, setCompany] = React.useState('');
-            const [tags, setTags] = React.useState([]);
+        const ContactModal = ({ isOpen, onClose, onSave, initialData }) => {
+            const empty = { first_name:'', last_name:'', email:'', phone:'', mobile_phone:'', company_name:'', tags:'', prospect_type:'', group_dot:'', asset_type:'', submarket:'', size_requirement:'', industry:'', building_name:'', building_address:'', notes:'' };
+            const [form, setForm] = React.useState(empty);
+            const [companies, setCompanies] = React.useState([]);
+            const { show } = useToast();
+
+            const contactTypes = ['Tenant', 'Buyer', 'Investor', 'Landlord', 'Owner', 'Seller', 'Other Broker'];
+            const prospectTypes = ['Tenant Rep', 'Landlord Rep', 'Buyer', 'Seller', 'Investor', 'Owner/User'];
+            const assetTypes = ['Industrial', 'Office', 'Flex/R&D', 'Land', 'Retail', 'Multi-Family'];
+            const submarkets = ['Bellevue', 'Kirkland', 'Redmond', 'Bothell', 'Woodinville', 'Issaquah', 'Snoqualmie', 'Everett', 'Renton', 'Kent', 'Auburn', 'Seattle', 'Other'];
+
+            React.useEffect(() => {
+                api.request('GET', '/api/companies').then(r => { if (!r.error) setCompanies(r.data || []); });
+            }, []);
 
             React.useEffect(() => {
                 if (initialData) {
-                    setName(initialData.name || '');
-                    setEmail(initialData.email || '');
-                    setPhone(initialData.phone || '');
-                    setCompany(initialData.company || '');
-                    setTags((initialData.tags || '').split(',').filter((t) => t.trim()));
+                    setForm({
+                        first_name: initialData.first_name || '',
+                        last_name: initialData.last_name || '',
+                        email: initialData.email || '',
+                        phone: initialData.phone || '',
+                        mobile_phone: initialData.mobile_phone || '',
+                        company_name: initialData.company_name || initialData.company || '',
+                        company_id: initialData.company_id || '',
+                        tags: initialData.tags || '',
+                        prospect_type: initialData.prospect_type || '',
+                        group_dot: initialData.group_dot || '',
+                        asset_type: initialData.asset_type || '',
+                        submarket: initialData.submarket || '',
+                        size_requirement: initialData.size_requirement || '',
+                        industry: initialData.industry || '',
+                        building_name: initialData.building_name || '',
+                        building_address: initialData.building_address || '',
+                        notes: initialData.notes || '',
+                    });
                 } else {
-                    setName('');
-                    setEmail('');
-                    setPhone('');
-                    setCompany('');
-                    setTags([]);
+                    setForm(empty);
                 }
             }, [initialData, isOpen]);
 
+            const set = (field) => (e) => setForm(f => ({ ...f, [field]: e.target.value }));
+            const toggleTag = (tag) => setForm(f => {
+                const current = f.tags.split(',').map(t => t.trim()).filter(Boolean);
+                const next = current.includes(tag) ? current.filter(t => t !== tag) : [...current, tag];
+                return { ...f, tags: next.join(', ') };
+            });
+
             const handleSubmit = (e) => {
                 e.preventDefault();
-                onSave({
-                    name,
-                    email,
-                    phone,
-                    company,
-                    tags: tags.join(', '),
-                });
+                if (!form.first_name.trim()) { show('First name required', 'error'); return; }
+                // Resolve company_id from name
+                const matchedCo = companies.find(c => c.name === form.company_name);
+                onSave({ ...form, company_id: matchedCo?.id || null });
             };
 
+            const activeTags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
+            const input = (label, field, opts = {}) => (
+                <div>
+                    <label className="block text-xs text-slate-400 mb-1">{label}</label>
+                    <input type={opts.type || 'text'} value={form[field]} onChange={set(field)}
+                        placeholder={opts.placeholder || ''}
+                        className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                </div>
+            );
+            const select = (label, field, options) => (
+                <div>
+                    <label className="block text-xs text-slate-400 mb-1">{label}</label>
+                    <select value={form[field]} onChange={set(field)}
+                        className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600">
+                        <option value="">— Select —</option>
+                        {options.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                </div>
+            );
+
             return (
-                <Modal
-                    isOpen={isOpen}
-                    onClose={onClose}
-                    title={initialData ? 'Edit Contact' : 'New Contact'}
-                    actions={
-                        <>
-                            <button
-                                onClick={onClose}
-                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleSubmit}
-                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
-                            >
-                                Save
-                            </button>
-                        </>
-                    }
+                <Modal isOpen={isOpen} onClose={onClose} title={initialData ? 'Edit Contact' : 'New Contact'}
+                    actions={<>
+                        <button onClick={onClose} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+                        <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white text-sm">Save</button>
+                    </>}
                 >
-                    <form className="space-y-4">
-                        <div>
-                            <label className="block text-sm font-medium mb-1">Name</label>
-                            <input
-                                type="text"
-                                value={name}
-                                onChange={(e) => setName(e.target.value)}
-                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
-                                placeholder="Contact name"
-                            />
+                    <form className="space-y-4" onSubmit={handleSubmit}>
+                        {/* Name row */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('First Name *', 'first_name', { placeholder: 'First' })}
+                            {input('Last Name', 'last_name', { placeholder: 'Last' })}
                         </div>
-                        <div>
-                            <label className="block text-sm font-medium mb-1">Email</label>
-                            <input
-                                type="email"
-                                value={email}
-                                onChange={(e) => setEmail(e.target.value)}
-                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
-                                placeholder="email@example.com"
-                            />
+
+                        {/* Contact info */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Direct Phone', 'phone', { type: 'tel', placeholder: '(206) 555-1234' })}
+                            {input('Mobile Phone', 'mobile_phone', { type: 'tel', placeholder: '(206) 555-5678' })}
                         </div>
+                        {input('Email', 'email', { type: 'email', placeholder: 'email@example.com' })}
+
+                        {/* Company */}
                         <div>
-                            <label className="block text-sm font-medium mb-1">Phone</label>
-                            <input
-                                type="tel"
-                                value={phone}
-                                onChange={(e) => setPhone(e.target.value)}
-                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
-                                placeholder="(206) 555-1234"
-                            />
+                            <label className="block text-xs text-slate-400 mb-1">Company</label>
+                            <input list="company-list" value={form.company_name} onChange={set('company_name')}
+                                placeholder="Type or select a company"
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600" />
+                            <datalist id="company-list">
+                                {companies.map(c => <option key={c.id} value={c.name} />)}
+                            </datalist>
                         </div>
-                        <div>
-                            <label className="block text-sm font-medium mb-1">Company</label>
-                            <input
-                                type="text"
-                                value={company}
-                                onChange={(e) => setCompany(e.target.value)}
-                                className="w-full bg-slate-700 rounded px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-600"
-                                placeholder="Company name"
-                            />
+
+                        {/* Classification */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {select('Prospect Type', 'prospect_type', prospectTypes)}
+                            {select('Asset Type', 'asset_type', assetTypes)}
                         </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            {select('Submarket', 'submarket', submarkets)}
+                            {input('Estimated Size', 'size_requirement', { placeholder: '5,000 SF' })}
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Industry', 'industry', { placeholder: 'e.g. Construction' })}
+                            {input('Group/Dot', 'group_dot', { placeholder: 'CRE OneSource group' })}
+                        </div>
+
+                        {/* Building info */}
+                        <div className="grid grid-cols-2 gap-3">
+                            {input('Building Name', 'building_name', { placeholder: 'e.g. Redmond Town Center' })}
+                            {input('Building Address', 'building_address', { placeholder: 'Street address' })}
+                        </div>
+
+                        {/* Contact type tags */}
                         <div>
-                            <label className="block text-sm font-medium mb-2">Tags</label>
+                            <label className="block text-xs text-slate-400 mb-2">Contact Type (select all that apply)</label>
                             <div className="flex flex-wrap gap-2">
-                                {availableTags.map((tag) => (
-                                    <button
-                                        key={tag}
-                                        type="button"
-                                        onClick={() =>
-                                            setTags(
-                                                tags.includes(tag)
-                                                    ? tags.filter((t) => t !== tag)
-                                                    : [...tags, tag]
-                                            )
-                                        }
-                                        className={`px-3 py-1 rounded text-sm transition ${
-                                            tags.includes(tag)
-                                                ? 'bg-blue-600 text-white'
-                                                : 'bg-slate-700 text-slate-300'
-                                        }`}
-                                    >
+                                {contactTypes.map(tag => (
+                                    <button key={tag} type="button" onClick={() => toggleTag(tag)}
+                                        className={`px-3 py-1 rounded text-xs transition ${activeTags.includes(tag) ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300'}`}>
                                         {tag}
                                     </button>
                                 ))}
                             </div>
+                        </div>
+
+                        {/* Notes */}
+                        <div>
+                            <label className="block text-xs text-slate-400 mb-1">Notes / Activities</label>
+                            <textarea value={form.notes} onChange={set('notes')} rows={3}
+                                placeholder="Notes, activity history..."
+                                className="w-full bg-slate-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600 resize-none" />
                         </div>
                     </form>
                 </Modal>
@@ -2601,236 +2620,138 @@
         // IMPORT PAGE
         // ============================================================================
 
+        // Detect CSV type from its headers
+        const detectCsvType = (csvText) => {
+            const firstLine = csvText.split('\n')[0].toLowerCase();
+            if (firstLine.includes('company name') && firstLine.includes('address line')) return 'companies';
+            if (firstLine.includes('first name') && firstLine.includes('last name')) return 'contacts';
+            if (firstLine.includes('property name') || (firstLine.includes('address') && firstLine.includes('size') && firstLine.includes('type'))) return 'properties';
+            if (firstLine.includes('activity type') || firstLine.includes('activity date') || firstLine.includes('subject')) return 'activities';
+            if (firstLine.includes('deal name') || firstLine.includes('stage') || firstLine.includes('deal type')) return 'deals';
+            return null;
+        };
+
+        const TYPE_META = {
+            companies:  { label: 'Companies',        endpoint: '/api/import/companies',  icon: '🏢' },
+            properties: { label: 'Properties',       endpoint: '/api/import/properties', icon: '🏗️' },
+            contacts:   { label: 'Contacts',         endpoint: '/api/import/contacts',   icon: '👥' },
+            activities: { label: 'Activities',       endpoint: '/api/import/activities', icon: '📋' },
+            deals:      { label: 'Deals',            endpoint: '/api/import/deals',      icon: '📈' },
+        };
+
         const ImportPage = () => {
-            const [companyFile, setCompanyFile] = React.useState(null);
-            const [propertyFile, setPropertyFile] = React.useState(null);
-            const [contactFile, setContactFile] = React.useState(null);
-            const [activityFile, setActivityFile] = React.useState(null);
-            const [dealFile, setDealFile] = React.useState(null);
-            const [loadingCompany, setLoadingCompany] = React.useState(false);
-            const [loadingProperty, setLoadingProperty] = React.useState(false);
-            const [loadingContact, setLoadingContact] = React.useState(false);
-            const [loadingActivity, setLoadingActivity] = React.useState(false);
-            const [loadingDeal, setLoadingDeal] = React.useState(false);
-            const [resultsCompany, setResultsCompany] = React.useState(null);
-            const [resultsProperty, setResultsProperty] = React.useState(null);
-            const [resultsContact, setResultsContact] = React.useState(null);
-            const [resultsActivity, setResultsActivity] = React.useState(null);
-            const [resultsDeal, setResultsDeal] = React.useState(null);
+            const [files, setFiles] = React.useState([]); // [{name, type, csv, status, result}]
+            const [importing, setImporting] = React.useState(false);
             const { show } = useToast();
 
-            const handleFileSelect = (e, setFile) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                    setFile(file);
-                }
-            };
-
-            const handleImport = async (file, endpoint, setLoading, setResults) => {
-                if (!file) {
-                    show('Please select a file', 'error');
-                    return;
-                }
-
-                setLoading(true);
+            const readFile = (file) => new Promise((resolve, reject) => {
                 const reader = new FileReader();
-                reader.onload = async (event) => {
-                    try {
-                        const csv = event.target?.result;
-                        const result = await api.request('POST', endpoint, { csv });
-
-                        if (result.error) {
-                            show(result.error, 'error');
-                            setResults(null);
-                        } else {
-                            const { imported = 0, skipped = 0 } = result.data || {};
-                            const total = imported + skipped;
-                            setResults({ imported, skipped, total });
-                            show(`Successfully imported ${imported} records`, 'success');
-                        }
-                    } catch (err) {
-                        show('Error reading file', 'error');
-                    } finally {
-                        setLoading(false);
-                    }
-                };
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = reject;
                 reader.readAsText(file);
+            });
+
+            const handleFilesSelected = async (e) => {
+                const selected = Array.from(e.target.files || []);
+                if (!selected.length) return;
+                const parsed = await Promise.all(selected.map(async (file) => {
+                    const csv = await readFile(file);
+                    const type = detectCsvType(csv);
+                    return { name: file.name, type, csv, status: type ? 'ready' : 'unknown', result: null };
+                }));
+                setFiles(parsed);
             };
+
+            const runImport = async () => {
+                const order = ['companies', 'properties', 'contacts', 'activities', 'deals'];
+                const ready = files.filter(f => f.type && f.status === 'ready');
+                if (!ready.length) { show('No recognizable CSV files selected', 'error'); return; }
+
+                setImporting(true);
+                // Sort by import order
+                const sorted = [...ready].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
+
+                for (const f of sorted) {
+                    setFiles(prev => prev.map(x => x.name === f.name ? { ...x, status: 'importing' } : x));
+                    const meta = TYPE_META[f.type];
+                    const result = await api.request('POST', meta.endpoint, { csv: f.csv });
+                    const data = result.data || {};
+                    setFiles(prev => prev.map(x => x.name === f.name ? {
+                        ...x,
+                        status: data.error ? 'error' : 'done',
+                        result: data.error ? { error: data.error } : { imported: data.imported || 0, skipped: data.skipped || 0 }
+                    } : x));
+                }
+                setImporting(false);
+                show('Import complete!', 'success');
+            };
+
+            const hasReady = files.some(f => f.type && f.status === 'ready');
 
             return (
-                <div className="space-y-6">
+                <div className="space-y-6 max-w-2xl">
                     <div>
                         <h1 className="text-2xl font-bold mb-2">Import Data</h1>
-                        <p className="text-slate-400 text-sm">Import your data from CRE OneSource CSV exports</p>
+                        <p className="text-slate-400 text-sm">Drop all your CRE OneSource CSV files at once — the importer will auto-detect each type and run them in the correct order.</p>
                     </div>
 
-                    <div className="bg-blue-900/30 border border-blue-600/50 rounded-lg p-4 mb-6">
-                        <p className="text-sm text-blue-200">
-                            <span className="font-medium">📌 Import order matters:</span> 1) Companies → 2) Properties → 3) Contacts → 4) Activities → 5) Deals
-                        </p>
+                    {/* Drop zone */}
+                    <div className="bg-slate-800 border-2 border-dashed border-slate-600 rounded-lg p-8 text-center">
+                        <div className="text-4xl mb-3">📂</div>
+                        <p className="text-slate-300 font-medium mb-1">Select your CSV files</p>
+                        <p className="text-slate-500 text-sm mb-4">You can select multiple files at once (Ctrl+click or Cmd+click)</p>
+                        <label className="cursor-pointer inline-block px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded font-medium text-sm transition">
+                            Browse Files
+                            <input
+                                type="file"
+                                accept=".csv"
+                                multiple
+                                className="hidden"
+                                onChange={handleFilesSelected}
+                            />
+                        </label>
                     </div>
 
-                    <div className="grid grid-cols-1 gap-6">
-                        {/* Companies Card */}
-                        <div className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-                            <h2 className="text-xl font-bold mb-2">Companies</h2>
-                            <p className="text-slate-400 text-sm mb-4">Import from CRE OneSource Companies export</p>
-
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3">
-                                    <input
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={(e) => handleFileSelect(e, setCompanyFile)}
-                                        className="flex-1 bg-slate-700 rounded px-3 py-2 text-white text-sm"
-                                    />
-                                    {companyFile && <span className="text-sm text-green-400">{companyFile.name}</span>}
-                                </div>
-                                <button
-                                    onClick={() => handleImport(companyFile, '/api/import/companies', setLoadingCompany, setResultsCompany)}
-                                    disabled={loadingCompany}
-                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-2 rounded text-white font-medium transition flex items-center justify-center gap-2"
-                                >
-                                    {loadingCompany ? <Spinner /> : '📤'} Import Companies
-                                </button>
-                                {resultsCompany && (
-                                    <div className="bg-green-900/30 border border-green-600/50 rounded p-3">
-                                        <p className="text-sm text-green-200">
-                                            ✓ Imported {resultsCompany.imported} records ({resultsCompany.skipped} skipped, Total: {resultsCompany.total})
-                                        </p>
+                    {/* File list */}
+                    {files.length > 0 && (
+                        <div className="bg-slate-800 rounded-lg divide-y divide-slate-700">
+                            {files.map((f, i) => {
+                                const meta = f.type ? TYPE_META[f.type] : null;
+                                return (
+                                    <div key={i} className="px-4 py-3 flex items-center justify-between gap-3">
+                                        <div className="flex items-center gap-3 min-w-0">
+                                            <span className="text-xl">{meta ? meta.icon : '❓'}</span>
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-medium truncate">{f.name}</p>
+                                                <p className="text-xs text-slate-400">{meta ? meta.label : 'Unrecognized — will be skipped'}</p>
+                                            </div>
+                                        </div>
+                                        <div className="flex-shrink-0 text-right">
+                                            {f.status === 'ready' && <span className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded">Ready</span>}
+                                            {f.status === 'importing' && <span className="text-xs bg-blue-700 text-blue-200 px-2 py-1 rounded">Importing...</span>}
+                                            {f.status === 'done' && f.result && (
+                                                <span className="text-xs bg-green-900/50 text-green-300 px-2 py-1 rounded">
+                                                    ✓ {f.result.imported} imported, {f.result.skipped} skipped
+                                                </span>
+                                            )}
+                                            {f.status === 'error' && <span className="text-xs bg-red-900/50 text-red-300 px-2 py-1 rounded">Error</span>}
+                                            {f.status === 'unknown' && <span className="text-xs bg-yellow-900/50 text-yellow-300 px-2 py-1 rounded">Skipped</span>}
+                                        </div>
                                     </div>
-                                )}
-                            </div>
+                                );
+                            })}
                         </div>
+                    )}
 
-                        {/* Properties Card */}
-                        <div className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-                            <h2 className="text-xl font-bold mb-2">Properties</h2>
-                            <p className="text-slate-400 text-sm mb-4">Import from CRE OneSource Properties export</p>
-
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3">
-                                    <input
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={(e) => handleFileSelect(e, setPropertyFile)}
-                                        className="flex-1 bg-slate-700 rounded px-3 py-2 text-white text-sm"
-                                    />
-                                    {propertyFile && <span className="text-sm text-green-400">{propertyFile.name}</span>}
-                                </div>
-                                <button
-                                    onClick={() => handleImport(propertyFile, '/api/import/properties', setLoadingProperty, setResultsProperty)}
-                                    disabled={loadingProperty}
-                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-2 rounded text-white font-medium transition flex items-center justify-center gap-2"
-                                >
-                                    {loadingProperty ? <Spinner /> : '📤'} Import Properties
-                                </button>
-                                {resultsProperty && (
-                                    <div className="bg-green-900/30 border border-green-600/50 rounded p-3">
-                                        <p className="text-sm text-green-200">
-                                            ✓ Imported {resultsProperty.imported} records ({resultsProperty.skipped} skipped, Total: {resultsProperty.total})
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Contacts Card */}
-                        <div className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-                            <h2 className="text-xl font-bold mb-2">Contacts</h2>
-                            <p className="text-slate-400 text-sm mb-4">Import from CRE OneSource Contacts export. Companies will be auto-created if needed.</p>
-
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3">
-                                    <input
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={(e) => handleFileSelect(e, setContactFile)}
-                                        className="flex-1 bg-slate-700 rounded px-3 py-2 text-white text-sm"
-                                    />
-                                    {contactFile && <span className="text-sm text-green-400">{contactFile.name}</span>}
-                                </div>
-                                <button
-                                    onClick={() => handleImport(contactFile, '/api/import/contacts', setLoadingContact, setResultsContact)}
-                                    disabled={loadingContact}
-                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-2 rounded text-white font-medium transition flex items-center justify-center gap-2"
-                                >
-                                    {loadingContact ? <Spinner /> : '📤'} Import Contacts
-                                </button>
-                                {resultsContact && (
-                                    <div className="bg-green-900/30 border border-green-600/50 rounded p-3">
-                                        <p className="text-sm text-green-200">
-                                            ✓ Imported {resultsContact.imported} records ({resultsContact.skipped} skipped, Total: {resultsContact.total})
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Activities Card */}
-                        <div className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-                            <h2 className="text-xl font-bold mb-2">Activities & Tasks</h2>
-                            <p className="text-slate-400 text-sm mb-4">Import from CRE OneSource Activities export. Will be linked to contacts automatically.</p>
-
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3">
-                                    <input
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={(e) => handleFileSelect(e, setActivityFile)}
-                                        className="flex-1 bg-slate-700 rounded px-3 py-2 text-white text-sm"
-                                    />
-                                    {activityFile && <span className="text-sm text-green-400">{activityFile.name}</span>}
-                                </div>
-                                <button
-                                    onClick={() => handleImport(activityFile, '/api/import/activities', setLoadingActivity, setResultsActivity)}
-                                    disabled={loadingActivity}
-                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-2 rounded text-white font-medium transition flex items-center justify-center gap-2"
-                                >
-                                    {loadingActivity ? <Spinner /> : '📤'} Import Activities
-                                </button>
-                                {resultsActivity && (
-                                    <div className="bg-green-900/30 border border-green-600/50 rounded p-3">
-                                        <p className="text-sm text-green-200">
-                                            ✓ Imported {resultsActivity.imported} records ({resultsActivity.skipped} skipped, Total: {resultsActivity.total})
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Deals Card */}
-                        <div className="bg-slate-800 rounded-lg p-6 border border-slate-700">
-                            <h2 className="text-xl font-bold mb-2">Deals</h2>
-                            <p className="text-slate-400 text-sm mb-4">Import from CRE OneSource Deals export. Contacts and Properties must be imported first.</p>
-
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3">
-                                    <input
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={(e) => handleFileSelect(e, setDealFile)}
-                                        className="flex-1 bg-slate-700 rounded px-3 py-2 text-white text-sm"
-                                    />
-                                    {dealFile && <span className="text-sm text-green-400">{dealFile.name}</span>}
-                                </div>
-                                <button
-                                    onClick={() => handleImport(dealFile, '/api/import/deals', setLoadingDeal, setResultsDeal)}
-                                    disabled={loadingDeal}
-                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-2 rounded text-white font-medium transition flex items-center justify-center gap-2"
-                                >
-                                    {loadingDeal ? <Spinner /> : '📤'} Import Deals
-                                </button>
-                                {resultsDeal && (
-                                    <div className="bg-green-900/30 border border-green-600/50 rounded p-3">
-                                        <p className="text-sm text-green-200">
-                                            ✓ Imported {resultsDeal.imported} records ({resultsDeal.skipped} skipped, Total: {resultsDeal.total})
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    </div>
+                    {hasReady && (
+                        <button
+                            onClick={runImport}
+                            disabled={importing}
+                            className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-3 rounded text-white font-medium transition flex items-center justify-center gap-2"
+                        >
+                            {importing ? <><Spinner /> Importing...</> : '🚀 Import All Files'}
+                        </button>
+                    )}
                 </div>
             );
         };
