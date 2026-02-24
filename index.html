@@ -2273,6 +2273,147 @@
                             </button>
                         </form>
                     </div>
+
+                    {/* Team Members Section */}
+                    <TeamMembersSection />
+                </div>
+            );
+        };
+
+        const TeamMembersSection = () => {
+            const [teamMembers, setTeamMembers] = React.useState([]);
+            const [showAddForm, setShowAddForm] = React.useState(false);
+            const [newName, setNewName] = React.useState('');
+            const [newEmail, setNewEmail] = React.useState('');
+            const [newPassword, setNewPassword] = React.useState('');
+            const [newRole, setNewRole] = React.useState('broker');
+            const [loading, setLoading] = React.useState(false);
+            const { show } = useToast();
+
+            const fetchTeam = async () => {
+                const result = await api.request('GET', '/api/users');
+                if (!result.error) setTeamMembers(result.data || result || []);
+            };
+
+            React.useEffect(() => { fetchTeam(); }, []);
+
+            const handleAddUser = async (e) => {
+                e.preventDefault();
+                if (!newName || !newEmail || !newPassword) {
+                    show('All fields required', 'error');
+                    return;
+                }
+                setLoading(true);
+                const result = await api.request('POST', '/api/users', {
+                    name: newName,
+                    email: newEmail,
+                    password: newPassword,
+                    role: newRole,
+                });
+                if (result.error) {
+                    show(result.error, 'error');
+                } else {
+                    show(`${newName} added to team`, 'success');
+                    setNewName(''); setNewEmail(''); setNewPassword(''); setNewRole('broker');
+                    setShowAddForm(false);
+                    fetchTeam();
+                }
+                setLoading(false);
+            };
+
+            return (
+                <div className="bg-slate-800 rounded-lg p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-xl font-bold">Team Members</h2>
+                        <button
+                            onClick={() => setShowAddForm(!showAddForm)}
+                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm"
+                        >
+                            + Add User
+                        </button>
+                    </div>
+
+                    {showAddForm && (
+                        <form onSubmit={handleAddUser} className="bg-slate-700 rounded-lg p-4 mb-4 space-y-3">
+                            <h3 className="font-medium text-sm text-slate-300">New Team Member</h3>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Name</label>
+                                    <input
+                                        type="text"
+                                        value={newName}
+                                        onChange={(e) => setNewName(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="Full name"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Email</label>
+                                    <input
+                                        type="email"
+                                        value={newEmail}
+                                        onChange={(e) => setNewEmail(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="email@example.com"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Password</label>
+                                    <input
+                                        type="password"
+                                        value={newPassword}
+                                        onChange={(e) => setNewPassword(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                        placeholder="Min 6 characters"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Role</label>
+                                    <select
+                                        value={newRole}
+                                        onChange={(e) => setNewRole(e.target.value)}
+                                        className="w-full bg-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    >
+                                        <option value="broker">Broker</option>
+                                        <option value="admin">Admin</option>
+                                        <option value="assistant">Assistant</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div className="flex gap-2 pt-1">
+                                <button
+                                    type="submit"
+                                    disabled={loading}
+                                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm disabled:opacity-50"
+                                >
+                                    {loading ? 'Adding...' : 'Add Team Member'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowAddForm(false)}
+                                    className="px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white rounded text-sm"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    )}
+
+                    <div className="divide-y divide-slate-700">
+                        {teamMembers.length === 0 ? (
+                            <p className="text-slate-400 text-sm py-2">No team members yet.</p>
+                        ) : (
+                            teamMembers.map((member) => (
+                                <div key={member.id} className="py-3 flex items-center justify-between">
+                                    <div>
+                                        <p className="font-medium text-sm">{member.name}</p>
+                                        <p className="text-xs text-slate-400">{member.email}</p>
+                                    </div>
+                                    <span className="text-xs bg-slate-700 px-2 py-1 rounded capitalize">{member.role}</span>
+                                </div>
+                            ))
+                        )}
+                    </div>
                 </div>
             );
         };
@@ -2723,7 +2864,7 @@
             return date.toLocaleDateString();
         };
 
-        const Layout = ({ page, onNavigate, user }) => {
+        const Layout = ({ page, onNavigate, user, logout }) => {
             const [searchQuery, setSearchQuery] = React.useState('');
             const [searchResults, setSearchResults] = React.useState([]);
             const [showSearchResults, setShowSearchResults] = React.useState(false);
@@ -2837,10 +2978,7 @@
                                 ⚙️ Settings
                             </button>
                             <button
-                                onClick={() => {
-                                    const { logout } = useAuth();
-                                    logout();
-                                }}
+                                onClick={logout}
                                 className="w-full text-left px-4 py-2 rounded text-sm text-slate-300 hover:bg-slate-800"
                             >
                                 🚪 {user?.name || 'User'} • Logout
@@ -2875,6 +3013,11 @@
 
             React.useEffect(() => {
                 const checkSetup = async () => {
+                    // If user already has a valid token, skip setup check entirely
+                    if (token) {
+                        setCheckingSetup(false);
+                        return;
+                    }
                     const result = await api.request('GET', '/auth/status');
                     if (!result.error) {
                         setSetupNeeded(!result.hasUsers);
@@ -2903,7 +3046,7 @@
 
             return (
                 <>
-                    <Layout page={currentPage} onNavigate={setCurrentPage} user={user} />
+                    <Layout page={currentPage} onNavigate={setCurrentPage} user={user} logout={logout} />
                     {toast && <div className="fixed bottom-4 right-4 z-50"><Toast {...toast} onClose={close} /></div>}
                 </>
             );
