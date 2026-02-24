@@ -1148,6 +1148,41 @@ function parseCSV(text) {
   });
 }
 
+// Clear data for re-import
+app.delete('/api/import/clear/:entity', authenticate, async (req, res) => {
+  try {
+    const entity = req.params.entity;
+    let count = 0;
+    if (entity === 'all') {
+      await pool.query('DELETE FROM inquiries');
+      await pool.query('DELETE FROM tasks');
+      await pool.query('DELETE FROM deals');
+      await pool.query('DELETE FROM contacts');
+      await pool.query('DELETE FROM properties');
+      await pool.query('DELETE FROM companies');
+      count = 'all';
+    } else if (entity === 'companies') {
+      const r = await pool.query('DELETE FROM companies'); count = r.rowCount;
+    } else if (entity === 'contacts') {
+      const r = await pool.query('DELETE FROM contacts'); count = r.rowCount;
+    } else if (entity === 'properties') {
+      await pool.query('DELETE FROM inquiries WHERE property_id IS NOT NULL');
+      const r = await pool.query('DELETE FROM properties'); count = r.rowCount;
+    } else if (entity === 'deals') {
+      const r = await pool.query('DELETE FROM deals'); count = r.rowCount;
+    } else if (entity === 'tasks') {
+      const r = await pool.query('DELETE FROM tasks'); count = r.rowCount;
+    } else {
+      return res.status(400).json({ error: 'Invalid entity' });
+    }
+    await logActivity('delete', entity, null, `Cleared ${count} ${entity} records`, 'Data reset for re-import', req.user.id);
+    res.json({ success: true, deleted: count });
+  } catch (err) {
+    console.error('Error clearing data:', err);
+    res.status(500).json({ error: 'Failed to clear data' });
+  }
+});
+
 // Import Companies
 app.post('/api/import/companies', authenticate, async (req, res) => {
   try {
@@ -1223,13 +1258,13 @@ app.post('/api/import/contacts', authenticate, async (req, res) => {
             row['Mobile Phone'] || row['Cell Phone'] || '',
             tags,
             row['Prospect Type'] || '',
-            row['Group'] || row['Dot'] || row['Group/Dot'] || '',
+            row['Group(s)'] || row['Group'] || row['Dot'] || row['Group/Dot'] || '',
             row['Asset Type'] || row['Property Type'] || '',
             row['Submarket'] || '',
             row['Estimated Size'] ? `${row['Estimated Size']} ${row['Size Type'] || 'SF'}`.trim() : '',
             row['Industry'] || '',
-            row['Building Name'] || '',
-            row['Building Address'] || row['Contact Notes'] || '',
+            row['Property Name'] || row['Building Name'] || '',
+            row['Building Address'] || '',
             row['Notes'] || '',
             req.user.id
           ]);
@@ -1296,22 +1331,24 @@ app.post('/api/import/properties', authenticate, async (req, res) => {
     let imported = 0, skipped = 0, errors = [];
 
     for (const row of rows) {
-      const address = (row['Address Line 1'] || row['Property Name'] || '').trim();
-      if (!address) { skipped++; continue; }
-      const existing = await pool.query('SELECT id FROM properties WHERE address = $1 AND city = $2',
-        [address, row['City'] || '']);
+      const propName = (row['Property Name'] || '').trim();
+      const address = (row['Address Line 1'] || propName).trim();
+      if (!propName && !address) { skipped++; continue; }
+      const existing = await pool.query(
+        'SELECT id FROM properties WHERE (name = $1 AND $1 != \'\') OR (address = $2 AND $2 != \'\')',
+        [propName, address]);
       if (existing.rows.length > 0) { skipped++; continue; }
       try {
-        const sizeSf = parseInt((row['Size'] || '').replace(/,/g, '')) || null;
+        const sizeSf = parseInt((row['Size'] || row['Lot Size'] || '').replace(/[,\s]/g, '')) || null;
         await pool.query(`INSERT INTO properties (name, address, city, state, submarket, type, size_sf, notes, created_by)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
           [
-            row['Property Name'] || '',
+            propName,
             address,
             row['City'] || '',
             row['State'] || 'WA',
             row['Submarket'] || '',
-            (row['Asset Type'] || 'industrial').toLowerCase(),
+            (row['Asset Type'] || row['Classification'] || '').toLowerCase() || null,
             sizeSf,
             row['Notes'] || '',
             req.user.id
@@ -1428,4 +1465,4 @@ app.get('*', (req, res) => {
     console.error('Failed to start server:', err);
     process.exit(1);
   }
-})();
+})()
