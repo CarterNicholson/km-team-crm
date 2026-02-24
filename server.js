@@ -71,15 +71,28 @@ async function initializeDatabase() {
         company_id INTEGER REFERENCES companies(id),
         email TEXT,
         phone TEXT,
+        mobile_phone TEXT,
         tags TEXT DEFAULT '',
+        prospect_type TEXT,
+        group_dot TEXT,
+        asset_type TEXT,
         submarket TEXT,
         size_requirement TEXT,
         industry TEXT,
+        building_name TEXT,
+        building_address TEXT,
         notes TEXT,
         created_by INTEGER REFERENCES users(id),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
+      -- Migrate existing contacts table (safe to run repeatedly)
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS mobile_phone TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS prospect_type TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS group_dot TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS asset_type TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS building_name TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS building_address TEXT;
 
       CREATE TABLE IF NOT EXISTS properties (
         id SERIAL PRIMARY KEY,
@@ -423,7 +436,11 @@ app.delete('/api/companies/:id', authenticate, async (req, res) => {
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT c.*, co.name as company_name, u.name as created_by_name
+      SELECT c.*,
+        (c.first_name || ' ' || COALESCE(c.last_name, '')) as name,
+        co.name as company_name,
+        co.name as company,
+        u.name as created_by_name
       FROM contacts c
       LEFT JOIN companies co ON c.company_id = co.id
       LEFT JOIN users u ON c.created_by = u.id
@@ -462,11 +479,11 @@ app.get('/api/contacts/:id', authenticate, async (req, res) => {
 
 app.post('/api/contacts', authenticate, async (req, res) => {
   try {
-    const { first_name, last_name, company_id, email, phone, tags, submarket, size_requirement, industry, notes } = req.body;
+    const { first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes } = req.body;
     if (!first_name) return res.status(400).json({ error: 'First name required' });
     const result = await pool.query(
-      'INSERT INTO contacts (first_name, last_name, company_id, email, phone, tags, submarket, size_requirement, industry, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [first_name, last_name, company_id || null, email, phone, tags || '', submarket, size_requirement, industry, notes, req.user.id]
+      'INSERT INTO contacts (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *',
+      [first_name, last_name, company_id || null, email, phone, mobile_phone, tags || '', prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, req.user.id]
     );
     const row = result.rows[0];
     await logActivity('create', 'contact', row.id, `${first_name} ${last_name || ''}`.trim(), null, req.user.id);
@@ -479,10 +496,10 @@ app.post('/api/contacts', authenticate, async (req, res) => {
 
 app.put('/api/contacts/:id', authenticate, async (req, res) => {
   try {
-    const { first_name, last_name, company_id, email, phone, tags, submarket, size_requirement, industry, notes } = req.body;
+    const { first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes } = req.body;
     await pool.query(
-      'UPDATE contacts SET first_name=$1, last_name=$2, company_id=$3, email=$4, phone=$5, tags=$6, submarket=$7, size_requirement=$8, industry=$9, notes=$10, updated_at=$11 WHERE id=$12',
-      [first_name, last_name, company_id || null, email, phone, tags || '', submarket, size_requirement, industry, notes, now(), req.params.id]
+      'UPDATE contacts SET first_name=$1, last_name=$2, company_id=$3, email=$4, phone=$5, mobile_phone=$6, tags=$7, prospect_type=$8, group_dot=$9, asset_type=$10, submarket=$11, size_requirement=$12, industry=$13, building_name=$14, building_address=$15, notes=$16, updated_at=$17 WHERE id=$18',
+      [first_name, last_name, company_id || null, email, phone, mobile_phone, tags || '', prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, now(), req.params.id]
     );
     const result = await pool.query('SELECT * FROM contacts WHERE id = $1', [req.params.id]);
     const row = result.rows[0];
@@ -1190,26 +1207,29 @@ app.post('/api/import/contacts', authenticate, async (req, res) => {
         }
       }
 
-      // Build tags from Contact Type + Prospect Type
-      const tagParts = [];
-      if (row['Contact Type']) tagParts.push(row['Contact Type']);
-      if (row['Prospect Type'] && row['Prospect Type'] !== row['Contact Type']) tagParts.push(row['Prospect Type']);
-      const tags = tagParts.filter(Boolean).join(',');
+      // Build tags from Contact Type
+      const tags = (row['Contact Type'] || '').trim();
 
       try {
         await pool.query(`INSERT INTO contacts
-          (first_name, last_name, company_id, email, phone, tags, submarket, size_requirement, industry, notes, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          (first_name, last_name, company_id, email, phone, mobile_phone, tags, prospect_type, group_dot, asset_type, submarket, size_requirement, industry, building_name, building_address, notes, created_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
           [
             firstName,
             row['Last Name'] || '',
             companyId,
             row['Email Address'] || '',
-            row['Phone'] || row['Mobile Phone'] || '',
+            row['Phone'] || row['Direct Phone'] || '',
+            row['Mobile Phone'] || row['Cell Phone'] || '',
             tags,
+            row['Prospect Type'] || '',
+            row['Group'] || row['Dot'] || row['Group/Dot'] || '',
+            row['Asset Type'] || row['Property Type'] || '',
             row['Submarket'] || '',
             row['Estimated Size'] ? `${row['Estimated Size']} ${row['Size Type'] || 'SF'}`.trim() : '',
             row['Industry'] || '',
+            row['Building Name'] || '',
+            row['Building Address'] || row['Contact Notes'] || '',
             row['Notes'] || '',
             req.user.id
           ]);
